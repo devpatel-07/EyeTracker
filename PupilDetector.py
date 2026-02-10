@@ -487,7 +487,7 @@ def process_video(video_path, input_method):
 def select_video():
     root = tk.Tk()
     root.withdraw()  # Hide the main window
-    video_path = 'C:/Google Drive/Eye Tracking/fulleyetest.mp4'
+    video_path = 'eye_test.mp4'
     if not os.path.exists(video_path):
         print("No file found at hardcoded path. Please select a video file.")
         video_path = filedialog.askopenfilename(title="Select Video File", filetypes=[("Video Files", "*.mp4;*.avi")])
