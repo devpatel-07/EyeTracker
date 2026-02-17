@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import sys
 import time
+import subprocess
 
 try:
     import gl_sphere
@@ -24,11 +25,32 @@ max_observed_distance = 0  # Initialize adaptive radius
 # Function to detect available cameras
 def detect_cameras(max_cams=10):
     available_cameras = []
+    is_mac = sys.platform == "darwin"
+    if is_mac:
+        try:
+            out = subprocess.run(["system_profiler", "SPCameraDataType"], capture_output=True, text=True)
+            names = []
+            for line in out.stdout.splitlines():
+                s = line.strip()
+                if s.endswith(":") and s != "Camera:":
+                    names.append(s[:-1])
+            if names:
+                for idx, name in enumerate(names):
+                    print(f"{idx}: {name}")
+        except Exception:
+            pass
+        backend = cv2.CAP_AVFOUNDATION
+    else:
+        backend = cv2.CAP_DSHOW
+
     for i in range(max_cams):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            available_cameras.append(i)
-            cap.release()
+        try:
+            cap = cv2.VideoCapture(i, backend)
+            if cap.isOpened():
+                available_cameras.append(i)
+                cap.release()
+        except Exception:
+            pass
     return available_cameras
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing.
@@ -854,6 +876,27 @@ def process_video():
 
     cap.release()
     cv2.destroyAllWindows()
+
+def process_stream():
+    #this url is prone to change because UT-IoT wifi does not assign a static IP.
+    cap = cv2.VideoCapture("http://10.159.64.14:8080/?action=stream")
+    if not cap.isOpened():
+        return
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        process_frame(frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord(' '):
+            cv2.waitKey(0)
+
+    cap.release()
+    cv2.destroyAllWindows()
     
 
 # GUI for selecting camera or video
@@ -876,6 +919,7 @@ def selection_gui():
 
     tk.Button(root, text="Start Camera", command=lambda: [root.destroy(), process_camera()]).pack(pady=5)
     tk.Button(root, text="Browse Video", command=lambda: [root.destroy(), process_video()]).pack(pady=5)
+    tk.Button(root, text="Connect Raspberry Pi Stream", command=lambda: [root.destroy(), process_stream()]).pack(pady=5)
 
     if GL_SPHERE_AVAILABLE:
         # Start GL sphere window once
