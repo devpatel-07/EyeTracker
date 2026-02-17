@@ -187,7 +187,7 @@ def fit_and_draw_ellipses(image, optimized_contours, color):
 #assists with checking ellipse goodness    
 def check_contour_pixels(contour, image_shape, debug_mode_on):
     # Check if the contour can be used to fit an ellipse (requires at least 5 points)
-    if len(contour) < 5:
+    if len(contour) < 8:
         return [0, 0]  # Not enough points to fit an ellipse
     
     # Create an empty mask for the contour
@@ -224,7 +224,7 @@ def check_contour_pixels(contour, image_shape, debug_mode_on):
 def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     ellipse_goodness = [0,0,0] #covered pixels, edge straightness stdev, skewedness   
     # Check if the contour can be used to fit an ellipse (requires at least 5 points)
-    if len(contour) < 5:
+    if len(contour) < 8:
         print("length of contour was 0")
         return 0  # Not enough points to fit an ellipse
     
@@ -771,7 +771,7 @@ def process_frame(frame):
 
     # Crop and resize frame
     frame = crop_to_aspect_ratio(frame)
-    frame = cv2.flip(frame, 0)
+    frame = cv2.flip(frame, 1)
 
     #find the darkest point
     darkest_point = get_darkest_area(frame)
@@ -814,7 +814,7 @@ def process_camera():
         if not ret:
             break
 
-        frame = cv2.flip(frame, 0)
+        frame = cv2.flip(frame, 1)
         process_frame(frame)
 
         key = cv2.waitKey(1) & 0xFF
@@ -828,7 +828,7 @@ def process_camera():
 
 # Process a selected video file
 def process_video():
-    video_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4;*.avi")])
+    video_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4")])
 
     if not video_path:
         return  # User canceled selection
