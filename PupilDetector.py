@@ -409,14 +409,15 @@ def process_video(video_path, input_method):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4 format
     out = cv2.VideoWriter('C:/Storage/Source Videos/output_video.mp4', fourcc, 30.0, (640, 480))  # Output video filename, codec, frame rate, and frame size
 
-    if input_method == 1:
-        cap = cv2.VideoCapture(video_path)
-    elif input_method == 2:
-        cap = cv2.VideoCapture(00, cv2.CAP_DSHOW)  # Camera input
-        cap.set(cv2.CAP_PROP_EXPOSURE, -5)
-    else:
-        print("Invalid video source.")
-        return
+    cap = cv2.VideoCapture(0)
+    # if input_method == 1:
+    #     cap = cv2.VideoCapture(video_path)
+    # elif input_method == 2:
+    #     cap = cv2.VideoCapture(00, cv2.CAP_DSHOW)  # Camera input
+    #     cap.set(cv2.CAP_PROP_EXPOSURE, -5)
+    # else:
+    #     print("Invalid video source.")
+    #     return
 
     if not cap.isOpened():
         print("Error: Could not open video.")
@@ -496,7 +497,7 @@ def select_video():
             return
             
     #second parameter is 1 for video 2 for webcam
-    process_video(video_path, 1)
+    process_video(video_path, 2)
 
 if __name__ == "__main__":
     select_video()
