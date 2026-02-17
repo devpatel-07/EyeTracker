@@ -8,6 +8,11 @@ import os
 from tkinter import filedialog
 import matplotlib.pyplot as plt
 
+#Initialize lists for tracking points across frames
+trackP1 = []
+trackP2 = []
+i = 0 #frame counter for indexing tracking points
+
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
 def crop_to_aspect_ratio(image, width=640, height=480):
     
@@ -352,6 +357,16 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
         cv2.ellipse(test_frame, ellipse, (55, 255, 0), 2)
+
+
+        #Fit Rectange
+        x, y, w, h = cv2.boundingRect(final_contours[0])
+        cv2.rectangle(test_frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
+        #Draw tracking points
+        cv2.circle(test_frame, (x+(w//2), y), 3, (255, 255, 255), -1)
+        cv2.circle(test_frame, (x+(w//2), y+h), 3, (255, 255, 255), -1)
+        
+
         #cv2.circle(test_frame, darkest_point, 3, (255, 125, 125), -1)
         center_x, center_y = map(int, ellipse[0])
         cv2.circle(test_frame, (center_x, center_y), 3, (255, 255, 0), -1)
