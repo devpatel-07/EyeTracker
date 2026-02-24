@@ -17,8 +17,9 @@ frame_index = 0 #frame counter for indexing tracking points
 ellipses = [[0], [0]]
 counter = 0
 eye_centers = []
+rays = [] # Used to store eyecenter lines (not in use yet)
 
-def eyecenter_estimation(ellipses):
+def eyecenter_estimation(ellipses, frame):
     cx1, cy1, angle1_deg = ellipses[0]
     cx2, cy2, angle2_deg = ellipses[1]
 
@@ -44,7 +45,14 @@ def eyecenter_estimation(ellipses):
     intersectionX = cx1 + t1 * dx1
     intersectionY = cy1 + t1 * dy1
 
-    return (int(intersectionX), int(intersectionY))
+    eye_center = (int(intersectionX), int(intersectionY))
+
+    # Visualizes the two rays in each frame from center of each ellipse to intersection
+    cv2.line(frame, (int(cx1), int(cy1)), eye_center, (255, 0, 255), 3)
+    cv2.line(frame, (int(cx2), int(cy2)), eye_center, (255, 0, 255), 3)
+
+    return eye_center
+
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
 def crop_to_aspect_ratio(image, width=640, height=480):
@@ -414,7 +422,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
            ellipses[1] = [center_x, center_y, ellipse_angle]
 
         if counter >= 1:
-            eye_center = eyecenter_estimation(ellipses)
+            eye_center = eyecenter_estimation(ellipses, test_frame)
             if len(eye_centers) >= 100:
                 eye_centers.pop(0)
             eye_centers.append(eye_center)
