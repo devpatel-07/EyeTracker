@@ -14,6 +14,37 @@ old_left = (0, 0)
 old_right = (0, 0)
 frame_index = 0 #frame counter for indexing tracking points
 
+ellipses = [[0], [0]]
+counter = 0
+
+def eyecenter_estimation(ellipses):
+    cx1, cy1, angle1_deg = ellipses[0]
+    cx2, cy2, angle2_deg = ellipses[1]
+
+    # Convert major axis angle to radians
+    a1 = np.deg2rad(angle1_deg)
+    a2 = np.deg2rad(angle2_deg)
+
+    # Minor axis is perpendicular to major axis
+    # major: (cos θ, sin θ) and minor: (-sin θ, cos θ)
+    dx1, dy1 = -np.sin(a1),  np.cos(a1)
+    dx2, dy2 = -np.sin(a2),  np.cos(a2)
+
+    # We need to find t where:  origin1 + t1dir1 = origin2 + t2dir2
+    # Rearranged into a 2x2 linear system A * [t1, t2] = B so we can use np.linalg
+    A = np.array([[dx1, -dx2], [dy1, -dy2]])
+    B = np.array([cx2 - cx1, cy2 - cy1])
+
+    if np.linalg.det(A) == 0:
+        return None # Lines are parallel
+
+    t1,  = np.linalg.solve(A, B)
+
+    intersectionX = cx1 + t1dx1
+    intersectionY = cy1 + t1dy1
+
+    return (int(intersectionX), int(intersectionY))
+
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
 def crop_to_aspect_ratio(image, width=640, height=480):
     
@@ -285,7 +316,7 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
 
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
   
-    global old_top, old_bottom, old_left, old_right, frame_index
+    global old_top, old_bottom, old_left, old_right, frame_index, counter
     final_rotated_rect = ((0,0),(0,0),0)
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
@@ -364,14 +395,26 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         #Fit Rectange
         x, y, w, h = cv2.boundingRect(final_contours[0])
         cv2.rectangle(test_frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
-        #Draw tracking points
 
 
-
+        #draw tracking points
         cv2.circle(test_frame, (x+(w//2), y), 3, (255, 255, 255), -1)
         cv2.circle(test_frame, (x+(w//2), y+h), 3, (255, 255, 255), -1)
         cv2.circle(test_frame, (x, y+(h//2)), 3, (255, 255, 255), -1)
         cv2.circle(test_frame, (x+w, y+(h//2)), 3, (255, 255, 255), -1)
+
+        (center_x, center_y), (_, _), ellipse_angle = ellipse
+
+        if counter % 2 == 0:
+           ellipses[0] = [center_x, center_y, ellipse_angle]
+        else:
+           ellipses[1] = [center_x, center_y, ellipse_angle]
+
+        if counter > 1:
+            eye_center = eyecenter_estimation(ellipses)
+            cv2.circle(test_frame, eye_center, 3, (255, 0, 255), -1)
+
+        counter += 1
 
         print(frame_index)
         if frame_index % 5 == 0:
