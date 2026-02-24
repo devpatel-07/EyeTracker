@@ -16,6 +16,7 @@ frame_index = 0 #frame counter for indexing tracking points
 
 ellipses = [[0], [0]]
 counter = 0
+eye_centers = []
 
 def eyecenter_estimation(ellipses):
     cx1, cy1, angle1_deg = ellipses[0]
@@ -316,7 +317,7 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
 
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
   
-    global old_top, old_bottom, old_left, old_right, frame_index, counter
+    global old_top, old_bottom, old_left, old_right, frame_index, counter, eye_centers
     final_rotated_rect = ((0,0),(0,0),0)
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
@@ -392,6 +393,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.ellipse(test_frame, ellipse, (55, 255, 0), 2)
 
 
+        '''
         #Fit Rectange
         x, y, w, h = cv2.boundingRect(final_contours[0])
         cv2.rectangle(test_frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
@@ -402,20 +404,27 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.circle(test_frame, (x+(w//2), y+h), 3, (255, 255, 255), -1)
         cv2.circle(test_frame, (x, y+(h//2)), 3, (255, 255, 255), -1)
         cv2.circle(test_frame, (x+w, y+(h//2)), 3, (255, 255, 255), -1)
+        '''
 
         (center_x, center_y), (_, _), ellipse_angle = ellipse
 
-        if counter % 2 == 0:
+        if counter % 2 == 0: 
            ellipses[0] = [center_x, center_y, ellipse_angle]
         else:
            ellipses[1] = [center_x, center_y, ellipse_angle]
 
-        if counter > 1:
+        if counter >= 1:
             eye_center = eyecenter_estimation(ellipses)
-            cv2.circle(test_frame, eye_center, 3, (255, 0, 255), -1)
-
+            if len(eye_centers) >= 100:
+                eye_centers.pop(0)
+            eye_centers.append(eye_center)
+            x_estimate = sum([x[0] for x in eye_centers if x]) // len(eye_centers)
+            y_estimate = sum([y[1] for y in eye_centers if y]) // len(eye_centers)
+            center_estimate = (x_estimate, y_estimate)
+            cv2.circle(test_frame, center_estimate, 5, (255, 255, 0), -1)
+        
         counter += 1
-
+        '''
         print(frame_index)
         if frame_index % 5 == 0:
             top = (x+(w//2), y)
@@ -423,19 +432,21 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             left = (x, y+(h//2))
             right = (x+w, y+(h//2))
 
-            # Draw lines between old and new tracking points
+            
+            #Draw lines between old and new tracking points
             cv2.line(test_frame, old_top, top, (0, 255, 0), 5)
             cv2.line(test_frame, old_bottom, bottom, (0, 255, 0), 5)
             cv2.line(test_frame, old_left, left, (0, 255, 0), 5)
             cv2.line(test_frame, old_right, right, (0, 255, 0), 5)
 
             print(str(top) + " " + str(old_top))
+            
 
             old_top = top
             old_bottom = bottom
             old_left = left
             old_right = right
-        
+        '''
 
         #cv2.circle(test_frame, darkest_point, 3, (255, 125, 125), -1)
         center_x, center_y = map(int, ellipse[0])
