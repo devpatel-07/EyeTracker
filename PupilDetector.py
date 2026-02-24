@@ -38,10 +38,10 @@ def eyecenter_estimation(ellipses):
     if np.linalg.det(A) == 0:
         return None # Lines are parallel
 
-    t1,  = np.linalg.solve(A, B)
+    t1, _ = np.linalg.solve(A, B)
 
-    intersectionX = cx1 + t1dx1
-    intersectionY = cy1 + t1dy1
+    intersectionX = cx1 + t1 * dx1
+    intersectionY = cy1 + t1 * dy1
 
     return (int(intersectionX), int(intersectionY))
 
