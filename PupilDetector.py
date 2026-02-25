@@ -20,6 +20,8 @@ eye_centers = []
 rays = [] # Used to store eyecenter lines (not in use yet)
 
 def eyecenter_estimation(ellipses, frame):
+    global rays
+
     cx1, cy1, angle1_deg = ellipses[0]
     cx2, cy2, angle2_deg = ellipses[1]
 
@@ -47,9 +49,21 @@ def eyecenter_estimation(ellipses, frame):
 
     eye_center = (int(intersectionX), int(intersectionY))
 
-    # Visualizes the two rays in each frame from center of each ellipse to intersection
-    cv2.line(frame, (int(cx1), int(cy1)), eye_center, (255, 0, 255), 3)
-    cv2.line(frame, (int(cx2), int(cy2)), eye_center, (255, 0, 255), 3)
+    # Adds the new ray(s) for this frame to the list
+    line1 = ((int(cx1), int(cy1)), eye_center)
+    line2 = ((int(cx2), int(cy2)), eye_center)
+    if line1 not in rays:
+        rays.append(line1)
+    if line2 not in rays:
+        rays.append(line2)
+
+    # Keeps list of rays 10 at most
+    if len(rays) > 10:
+        rays = rays[-10:]
+
+    # Visualizes up to 10 rays in each frame from center of each ellipse to intersection
+    for ellipse_center, intersection in rays:
+        cv2.line(frame, ellipse_center, intersection, (255, 0, 255), 1)
 
     return eye_center
 
