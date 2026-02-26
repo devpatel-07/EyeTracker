@@ -14,9 +14,9 @@ old_left = (0, 0)
 old_right = (0, 0)
 frame_index = 0 #frame counter for indexing tracking points
 
-ellipses = [[0], [0]]
-counter = 0
-eye_centers = []
+ellipses = [[0], [0]] #stores the 2 most recent fit ellipses (center and angle)
+counter = 0 # keeps track of frames
+eye_centers = [] # Used to store eye_center estimates (max of 100)
 rays = [] # Used to store eyecenter lines (not in use yet)
 
 def eyecenter_estimation(ellipses, frame):
@@ -428,6 +428,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.circle(test_frame, (x+w, y+(h//2)), 3, (255, 255, 255), -1)
         '''
 
+        #Storing information from each pupil ellipse
         (center_x, center_y), (_, _), ellipse_angle = ellipse
 
         if counter % 2 == 0: 
@@ -435,16 +436,21 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         else:
            ellipses[1] = [center_x, center_y, ellipse_angle]
 
+        #checks for if there has been at least 2 frames
         if counter >= 1:
+            #finds eye center estimate from 2 most recent frames
             eye_center = eyecenter_estimation(ellipses, test_frame)
+            #updates list of past 100 eye center estimates
             if len(eye_centers) >= 100:
                 eye_centers.pop(0)
             eye_centers.append(eye_center)
+            #display average eye center estimate
             x_estimate = sum([x[0] for x in eye_centers if x]) // len(eye_centers)
             y_estimate = sum([y[1] for y in eye_centers if y]) // len(eye_centers)
             center_estimate = (x_estimate, y_estimate)
             cv2.circle(test_frame, center_estimate, 5, (255, 255, 0), -1)
         
+        #track frames
         counter += 1
         '''
         print(frame_index)
