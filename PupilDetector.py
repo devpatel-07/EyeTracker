@@ -429,7 +429,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         '''
 
         #Storing information from each pupil ellipse
-        (center_x, center_y), (_, _), ellipse_angle = ellipse
+        (center_x, center_y), (majorAxis_len, _), ellipse_angle = ellipse
+        
 
         if counter % 2 == 0: 
            ellipses[0] = [center_x, center_y, ellipse_angle]
@@ -452,6 +453,15 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         
         #track frames
         counter += 1
+
+        eye_center_boundary = np.zeros_like(test_frame)
+        eye_center_boundary_grayscale = cv2.cvtColor(eye_center_boundary, cv2.COLOR_BGR2GRAY)
+        frame_height, frame_width = frame.shape[0:2]
+        cv2.circle(eye_center_boundary_grayscale, (frame_width//2, frame_height//2), int(frame_height*0.5), (255, 0, 255), 2)
+        boundary_contours, _ = cv2.findContours(eye_center_boundary_grayscale, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(test_frame, boundary_contours, 0, (255,0,255), 2)
+
+
         '''
         print(frame_index)
         if frame_index % 5 == 0:
