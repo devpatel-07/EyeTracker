@@ -14,7 +14,7 @@ old_left = (0, 0)
 old_right = (0, 0)
 frame_index = 0 #frame counter for indexing tracking points
 
-ellipses = [[0], [0]] #stores the 2 most recent fit ellipses (center and angle)
+ellipses = [[0], [0], [0]] #stores the 3 most recent fit ellipses (center and angle)
 counter = 0 # keeps track of frames
 eye_centers = [] # Used to store eye_center estimates (max of 100)
 rays = [] # Used to store eyecenter lines (not in use yet)
@@ -24,38 +24,57 @@ def eyecenter_estimation(ellipses, frame):
 
     cx1, cy1, angle1_deg = ellipses[0]
     cx2, cy2, angle2_deg = ellipses[1]
+    cx3, cy3, angle3_deg = ellipses[2]
 
     # Convert major axis angle to radians
     a1 = np.deg2rad(angle1_deg)
     a2 = np.deg2rad(angle2_deg)
+    a3 = np.deg2rad(angle3_deg)
 
     # Minor axis is perpendicular to major axis
     # major: (cos θ, sin θ) and minor: (-sin θ, cos θ)
     dx1, dy1 = -np.sin(a1),  np.cos(a1)
     dx2, dy2 = -np.sin(a2),  np.cos(a2)
+    dx3, dy3 = -np.sin(a3), np.cos(a3)
 
-    # We need to find t where:  origin1 + t1dir1 = origin2 + t2dir2
-    # Rearranged into a 2x2 linear system A * [t1, t2] = B so we can use np.linalg
-    A = np.array([[dx1, -dx2], [dy1, -dy2]])
-    B = np.array([cx2 - cx1, cy2 - cy1])
+    # Ray combos to calculate intersection
+    pairs = [
+        (cx1, cy1, dx1, dy1, cx2, cy2, dx2, dy2),
+        (cx2, cy2, dx2, dy2, cx3, cy3, dx3, dy3),
+        (cx1, cy1, dx1, dy1, cx3, cy3, dx3, dy3)
+    ]
 
-    if np.linalg.det(A) == 0:
-        return None # Lines are parallel
+    # Stores all intersections
+    intersections = []
 
-    t1, _ = np.linalg.solve(A, B)
+    # Calculates each intersection and stores them
+    for (x1, y1, ddx1, ddy1, x2, y2, ddx2, ddy2) in pairs:
+        # We need to find t where:  origin1 + t1dir1 = origin2 + t2dir2
+        # Rearranged into a 2x2 linear system A * [t1, t2] = B so we can use np.linalg
+        A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
+        B = np.array([x2 - x1, y2 - y1])
 
-    intersectionX = cx1 + t1 * dx1
-    intersectionY = cy1 + t1 * dy1
+        if np.linalg.det(A) == 0:
+            continue # Lines are parallel, move on to find next intersection
 
-    eye_center = (int(intersectionX), int(intersectionY))
+        # Calculates t
+        t1, _ = np.linalg.solve(A, B)
 
-    # Adds the new ray(s) for this frame to the list
-    line1 = ((int(cx1), int(cy1)), eye_center)
-    line2 = ((int(cx2), int(cy2)), eye_center)
-    if line1 not in rays:
-        rays.append(line1)
-    if line2 not in rays:
-        rays.append(line2)
+        # Parametric equations to calculate intersection point
+        intersectionX = x1 + t1 * ddx1
+        intersectionY = y1 + t1 * ddy1
+
+        eye_center = (int(intersectionX), int(intersectionY))
+
+        intersections.append(eye_center)
+
+        # Adds the new ray(s) for this frame to the list
+        line1 = ((int(x1), int(y1)), eye_center)
+        line2 = ((int(x2), int(y2)), eye_center)
+        if line1 not in rays:
+            rays.append(line1)
+        if line2 not in rays:
+            rays.append(line2)
 
     # Keeps list of rays 10 at most
     if len(rays) > 10:
@@ -65,7 +84,15 @@ def eyecenter_estimation(ellipses, frame):
     for ellipse_center, intersection in rays:
         cv2.line(frame, ellipse_center, intersection, (255, 0, 255), 1)
 
-    return eye_center
+    # Every line was parallel
+    if not intersections:
+        return None
+
+    # Returns average of all intersections from 3 rays
+    avg_x = int(np.mean([pt[0] for pt in intersections]))
+    avg_y = int(np.mean([pt[1] for pt in intersections]))
+    
+    return (avg_x, avg_y)
 
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
@@ -427,40 +454,42 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.circle(test_frame, (x, y+(h//2)), 3, (255, 255, 255), -1)
         cv2.circle(test_frame, (x+w, y+(h//2)), 3, (255, 255, 255), -1)
         '''
+        frame_height, frame_width = frame.shape[0:2]
+        boundary_center = (frame_width//2, frame_height//2)
+        boundary_radius = int(frame_height * 0.5)
+        cv2.circle(test_frame, boundary_center, boundary_radius, (255, 0, 255), 2)
+
 
         #Storing information from each pupil ellipse
         (center_x, center_y), (majorAxis_len, _), ellipse_angle = ellipse
-        
 
-        if counter % 2 == 0: 
-           ellipses[0] = [center_x, center_y, ellipse_angle]
+        if counter % 3 == 0: 
+            ellipses[0] = [center_x, center_y, ellipse_angle]
+        elif counter % 3 == 1:
+            ellipses[1] = [center_x, center_y, ellipse_angle]
         else:
-           ellipses[1] = [center_x, center_y, ellipse_angle]
+            ellipses[2] = [center_x, center_y, ellipse_angle]
 
-        #checks for if there has been at least 2 frames
-        if counter >= 1:
-            #finds eye center estimate from 2 most recent frames
+        #checks for if there has been at least 3 frames
+        if counter >= 2:
+            #finds eye center estimate from 3 most recent frames
             eye_center = eyecenter_estimation(ellipses, test_frame)
             #updates list of past 100 eye center estimates
             if len(eye_centers) >= 100:
                 eye_centers.pop(0)
-            eye_centers.append(eye_center)
+            if eye_center is not None:
+                d_squared = (eye_center[0] - boundary_center[0])**2 + (eye_center[1] - boundary_center[1])**2
+                if d_squared < boundary_radius**2:
+                    eye_centers.append(eye_center)
             #display average eye center estimate
-            x_estimate = sum([x[0] for x in eye_centers if x]) // len(eye_centers)
-            y_estimate = sum([y[1] for y in eye_centers if y]) // len(eye_centers)
-            center_estimate = (x_estimate, y_estimate)
-            cv2.circle(test_frame, center_estimate, 5, (255, 255, 0), -1)
+            if len(eye_centers) > 0:
+                x_estimate = sum([x[0] for x in eye_centers if x]) // len(eye_centers)
+                y_estimate = sum([y[1] for y in eye_centers if y]) // len(eye_centers)
+                center_estimate = (x_estimate, y_estimate)
+                cv2.circle(test_frame, center_estimate, 5, (255, 255, 0), -1)
         
         #track frames
         counter += 1
-
-        eye_center_boundary = np.zeros_like(test_frame)
-        eye_center_boundary_grayscale = cv2.cvtColor(eye_center_boundary, cv2.COLOR_BGR2GRAY)
-        frame_height, frame_width = frame.shape[0:2]
-        cv2.circle(eye_center_boundary_grayscale, (frame_width//2, frame_height//2), int(frame_height*0.5), (255, 0, 255), 2)
-        boundary_contours, _ = cv2.findContours(eye_center_boundary_grayscale, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(test_frame, boundary_contours, 0, (255,0,255), 2)
-
 
         '''
         print(frame_index)
