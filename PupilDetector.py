@@ -486,7 +486,35 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
                 x_estimate = sum([x[0] for x in eye_centers if x]) // len(eye_centers)
                 y_estimate = sum([y[1] for y in eye_centers if y]) // len(eye_centers)
                 center_estimate = (x_estimate, y_estimate)
+
+                # --- Calculates vector between 2D pupil center and 3D eye center ---
+                pupil = (center_x, center_y)
+                eye_center = center_estimate
+
+                dx = eye_center[0] - pupil[0]
+                dy = eye_center[1] - pupil[1]
+
+                length = np.sqrt(dx**2 + dy**2)
+
+                if length != 0:
+
+                    ux = dx / length
+                    uy = dy / length
+
+                    pixels_per_mm = 1   # <-- NEED TO ADJUST BASED ON THE SIZE OF THE PUPIL IN OUR VIDEO, 1 assumes that every pixel is a mm
+                    distance_mm = 12
+                    distance_px = distance_mm * pixels_per_mm
+
+                    new_x = pupil[0] + ux * distance_px
+                    new_y = pupil[1] + uy * distance_px
+
+                    new_point = (int(new_x), int(new_y))
+
+                cv2.circle(test_frame, new_point, 6, (0, 0, 255), -1)
+
                 cv2.circle(test_frame, center_estimate, 5, (255, 255, 0), -1)
+
+                cv2.line(test_frame, (int(center_x), int(center_y)), center_estimate, (0, 255, 255), 2)
         
         #track frames
         counter += 1
