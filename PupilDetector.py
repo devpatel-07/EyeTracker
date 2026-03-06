@@ -19,6 +19,8 @@ counter = 0 # keeps track of frames
 eye_centers = [] # Used to store eye_center estimates (max of 100)
 rays = [] # Used to store eyecenter lines (not in use yet)
 
+indexCounter = 0 # Tracks number of times eye center estimate updates
+
 def eyecenter_estimation(ellipses, frame):
     global rays
 
@@ -366,7 +368,7 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
 
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
   
-    global old_top, old_bottom, old_left, old_right, frame_index, counter, eye_centers
+    global old_top, old_bottom, old_left, old_right, frame_index, counter, eye_centers, indexCounter
     final_rotated_rect = ((0,0),(0,0),0)
 
     image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
@@ -475,12 +477,15 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             #finds eye center estimate from 3 most recent frames
             eye_center = eyecenter_estimation(ellipses, test_frame)
             #updates list of past 100 eye center estimates
-            if len(eye_centers) >= 100:
-                eye_centers.pop(0)
             if eye_center is not None:
                 d_squared = (eye_center[0] - boundary_center[0])**2 + (eye_center[1] - boundary_center[1])**2
                 if d_squared < boundary_radius**2:
-                    eye_centers.append(eye_center)
+                    if (len(eye_centers) < 100):
+                        eye_centers.append(eye_center)
+                    else:
+                        eye_centers[indexCounter % 100] = eye_center
+                        indexCounter += 1
+
             #display average eye center estimate
             if len(eye_centers) > 0:
                 x_estimate = sum([x[0] for x in eye_centers if x]) // len(eye_centers)
