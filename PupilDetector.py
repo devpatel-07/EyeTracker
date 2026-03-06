@@ -56,8 +56,15 @@ def eyecenter_estimation(ellipses, frame):
         A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
         B = np.array([x2 - x1, y2 - y1])
 
-        if np.linalg.det(A) == 0:
-            continue # Lines are parallel, move on to find next intersection
+        
+        v1 = np.array([ddx1, ddy1])
+        v2 = np.array([ddx2, ddy2])
+
+        cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+        if abs(cos_theta) > np.cos(np.deg2rad(2)):
+            # angle between lines < 2 degrees
+            continue
 
         # Calculates t
         t1, _ = np.linalg.solve(A, B)
@@ -385,6 +392,8 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     gray_copy3 = gray_frame.copy()
     gray_copies = [gray_copy1, gray_copy2, gray_copy3]
     final_goodness = 0
+
+    arraySize = 1500
     
     #iterate through binary images and see which fits the ellipse best
     for i in range(1,4):
@@ -480,10 +489,10 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             if eye_center is not None:
                 d_squared = (eye_center[0] - boundary_center[0])**2 + (eye_center[1] - boundary_center[1])**2
                 if d_squared < boundary_radius**2:
-                    if (len(eye_centers) < 100):
+                    if (len(eye_centers) < arraySize):
                         eye_centers.append(eye_center)
                     else:
-                        eye_centers[indexCounter % 100] = eye_center
+                        eye_centers[indexCounter % arraySize] = eye_center
                         indexCounter += 1
 
             #display average eye center estimate
