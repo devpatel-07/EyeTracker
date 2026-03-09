@@ -20,70 +20,51 @@ eye_centers = [] # Used to store eye_center estimates (max of 100)
 rays = [] # Used to store eyecenter lines (not in use yet)
 
 indexCounter = 0 # Tracks number of times eye center estimate updates
+ENABLE_COORD_PRINTS = True
+PRINT_EVERY_N_FRAMES = 1
 
 def eyecenter_estimation(ellipses, frame):
     global rays
 
-    cx1, cy1, angle1_deg = ellipses[0]
-    cx2, cy2, angle2_deg = ellipses[1]
-    cx3, cy3, angle3_deg = ellipses[2]
+    valid_ellipses = [e for e in ellipses if isinstance(e, (list, tuple)) and len(e) == 3]
+    if len(valid_ellipses) < 2:
+        return None
 
-    # Convert major axis angle to radians
-    a1 = np.deg2rad(angle1_deg)
-    a2 = np.deg2rad(angle2_deg)
-    a3 = np.deg2rad(angle3_deg)
-
-    # Minor axis is perpendicular to major axis
-    # major: (cos θ, sin θ) and minor: (-sin θ, cos θ)
-    dx1, dy1 = -np.sin(a1),  np.cos(a1)
-    dx2, dy2 = -np.sin(a2),  np.cos(a2)
-    dx3, dy3 = -np.sin(a3), np.cos(a3)
-
-    # Ray combos to calculate intersection
-    pairs = [
-        (cx1, cy1, dx1, dy1, cx2, cy2, dx2, dy2),
-        (cx2, cy2, dx2, dy2, cx3, cy3, dx3, dy3),
-        (cx1, cy1, dx1, dy1, cx3, cy3, dx3, dy3)
-    ]
-
-    # Stores all intersections
-    intersections = []
-
-    # Calculates each intersection and stores them
-    for (x1, y1, ddx1, ddy1, x2, y2, ddx2, ddy2) in pairs:
-        # We need to find t where:  origin1 + t1dir1 = origin2 + t2dir2
-        # Rearranged into a 2x2 linear system A * [t1, t2] = B so we can use np.linalg
-        A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
-        B = np.array([x2 - x1, y2 - y1])
-
-        
-        v1 = np.array([ddx1, ddy1])
-        v2 = np.array([ddx2, ddy2])
-
-        cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-
-        if abs(cos_theta) > np.cos(np.deg2rad(2)):
-            # angle between lines < 2 degrees
+    # Build line set from the minor-axis directions of recent pupil ellipses.
+    line_origins = []
+    line_dirs = []
+    for cx, cy, angle_deg in valid_ellipses:
+        a = np.deg2rad(angle_deg)
+        d = np.array([-np.sin(a), np.cos(a)], dtype=np.float64)
+        norm_d = np.linalg.norm(d)
+        if norm_d == 0:
             continue
+        line_dirs.append(d / norm_d)
+        line_origins.append(np.array([cx, cy], dtype=np.float64))
 
-        # Calculates t
-        t1, _ = np.linalg.solve(A, B)
+    if len(line_dirs) < 2:
+        return None
 
-        # Parametric equations to calculate intersection point
-        intersectionX = x1 + t1 * ddx1
-        intersectionY = y1 + t1 * ddy1
+    # Solve least-squares line intersection: sum((I-dd^T))(c) = sum((I-dd^T)(p)).
+    A = np.zeros((2, 2), dtype=np.float64)
+    b = np.zeros(2, dtype=np.float64)
+    I = np.eye(2, dtype=np.float64)
 
-        eye_center = (int(intersectionX), int(intersectionY))
+    for p, d in zip(line_origins, line_dirs):
+        M = I - np.outer(d, d)
+        A += M
+        b += M @ p
 
-        intersections.append(eye_center)
+    if np.linalg.cond(A) > 1e8:
+        return None
 
-        # Adds the new ray(s) for this frame to the list
-        line1 = ((int(x1), int(y1)), eye_center)
-        line2 = ((int(x2), int(y2)), eye_center)
-        if line1 not in rays:
-            rays.append(line1)
-        if line2 not in rays:
-            rays.append(line2)
+    center = np.linalg.solve(A, b)
+    eye_center = (int(center[0]), int(center[1]))
+
+    for p in line_origins:
+        line = ((int(p[0]), int(p[1])), eye_center)
+        if line not in rays:
+            rays.append(line)
 
     # Keeps list of rays 10 at most
     if len(rays) > 10:
@@ -93,15 +74,7 @@ def eyecenter_estimation(ellipses, frame):
     for ellipse_center, intersection in rays:
         cv2.line(frame, ellipse_center, intersection, (255, 0, 255), 1)
 
-    # Every line was parallel
-    if not intersections:
-        return None
-
-    # Returns average of all intersections from 3 rays
-    avg_x = int(np.mean([pt[0] for pt in intersections]))
-    avg_y = int(np.mean([pt[1] for pt in intersections]))
-    
-    return (avg_x, avg_y)
+    return eye_center
 
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
@@ -204,7 +177,7 @@ def optimize_contours_by_angle(contours, image):
     all_contours = np.concatenate(contours[0], axis=0)
 
     # Set spacing based on size of contours
-    spacing = int(len(all_contours)/25)  # Spacing between sampled points
+    spacing = max(1, int(len(all_contours) / 25))  # Spacing between sampled points
 
     # Temporary array for result
     filtered_points = []
@@ -446,7 +419,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     
     final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
     
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
+    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0]) > 5:
         #cv2.drawContours(test_frame, final_contours, -1, (255, 255, 255), 1)
         ellipse = cv2.fitEllipse(final_contours[0])
         final_rotated_rect = ellipse
@@ -473,6 +446,11 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
 
         #Storing information from each pupil ellipse
         (center_x, center_y), (majorAxis_len, _), ellipse_angle = ellipse
+        pupil_center_int = (int(center_x), int(center_y))
+        eye_center_raw = None
+        center_estimate = None
+        gaze_dir_print = None
+        gaze_end_pt = None
 
         if counter % 3 == 0: 
             ellipses[0] = [center_x, center_y, ellipse_angle]
@@ -485,6 +463,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         if counter >= 2:
             #finds eye center estimate from 3 most recent frames
             eye_center = eyecenter_estimation(ellipses, test_frame)
+            eye_center_raw = eye_center
             #updates list of past 100 eye center estimates
             if eye_center is not None:
                 d_squared = (eye_center[0] - boundary_center[0])**2 + (eye_center[1] - boundary_center[1])**2
@@ -501,6 +480,29 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
                 y_estimate = sum([y[1] for y in eye_centers if y]) // len(eye_centers)
                 center_estimate = (x_estimate, y_estimate)
                 cv2.circle(test_frame, center_estimate, 5, (255, 255, 0), -1)
+
+                # Draw gaze direction from eye center through pupil center.
+                pupil_center = np.array([center_x, center_y], dtype=np.float64)
+                eye_center_np = np.array(center_estimate, dtype=np.float64)
+                gaze_dir = pupil_center - eye_center_np
+                gaze_norm = np.linalg.norm(gaze_dir)
+                if gaze_norm > 1e-6:
+                    gaze_dir /= gaze_norm
+                    gaze_dir_print = (round(float(gaze_dir[0]), 4), round(float(gaze_dir[1]), 4))
+                    gaze_length_px = 120
+                    gaze_end = pupil_center + gaze_dir * gaze_length_px
+                    gaze_end_pt = (int(gaze_end[0]), int(gaze_end[1]))
+                    cv2.arrowedLine(test_frame, center_estimate, gaze_end_pt, (0, 200, 255), 2, tipLength=0.25)
+
+        if ENABLE_COORD_PRINTS and (frame_index % PRINT_EVERY_N_FRAMES == 0):
+            print(
+                f"frame={frame_index} "
+                f"pupil={pupil_center_int} "
+                f"eye_center_raw={eye_center_raw} "
+                f"eye_center_avg={center_estimate} "
+                f"gaze_dir={gaze_dir_print} "
+                f"gaze_end={gaze_end_pt}"
+            )
         
         #track frames
         counter += 1
@@ -530,7 +532,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         '''
 
         #cv2.circle(test_frame, darkest_point, 3, (255, 125, 125), -1)
-        center_x, center_y = map(int, ellipse[0])
+        center_x, center_y = pupil_center_int
         cv2.circle(test_frame, (center_x, center_y), 3, (255, 255, 0), -1)
         cv2.putText(test_frame, "SPACE = play/pause", (10,410), cv2.FONT_HERSHEY_SIMPLEX, .55, (255,90,30), 2) #space
         cv2.putText(test_frame, "Q      = quit", (10,430), cv2.FONT_HERSHEY_SIMPLEX, .55, (255,90,30), 2) #quit
