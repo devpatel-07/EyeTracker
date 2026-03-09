@@ -5,7 +5,7 @@ import numpy as np
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog
-import sys
+import sys 
 import time
 
 try:
