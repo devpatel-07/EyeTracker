@@ -14,7 +14,7 @@ old_left = (0, 0)
 old_right = (0, 0)
 frame_index = 0 #frame counter for indexing tracking points
 
-ellipses = [[0], [0], [0]] #stores the 3 most recent fit ellipses (center and angle)
+ellipses = [[0, 0, 0]] * 10 #stores the 3 most recent fit ellipses (center and angle)
 counter = 0 # keeps track of frames
 eye_centers = [] # Used to store eye_center estimates (max of 100)
 rays = [] # Used to store eyecenter lines (not in use yet)
@@ -24,84 +24,60 @@ indexCounter = 0 # Tracks number of times eye center estimate updates
 def eyecenter_estimation(ellipses, frame):
     global rays
 
-    cx1, cy1, angle1_deg = ellipses[0]
-    cx2, cy2, angle2_deg = ellipses[1]
-    cx3, cy3, angle3_deg = ellipses[2]
+    # Build rays for all ellipses
+    current_rays = []
+    for (cx, cy, angle_deg) in ellipses:
+        a = np.deg2rad(angle_deg)
+        dx, dy = -np.sin(a), np.cos(a)
+        current_rays.append((cx, cy, dx, dy))
 
-    # Convert major axis angle to radians
-    a1 = np.deg2rad(angle1_deg)
-    a2 = np.deg2rad(angle2_deg)
-    a3 = np.deg2rad(angle3_deg)
-
-    # Minor axis is perpendicular to major axis
-    # major: (cos θ, sin θ) and minor: (-sin θ, cos θ)
-    dx1, dy1 = -np.sin(a1),  np.cos(a1)
-    dx2, dy2 = -np.sin(a2),  np.cos(a2)
-    dx3, dy3 = -np.sin(a3), np.cos(a3)
-
-    # Ray combos to calculate intersection
-    pairs = [
-        (cx1, cy1, dx1, dy1, cx2, cy2, dx2, dy2),
-        (cx2, cy2, dx2, dy2, cx3, cy3, dx3, dy3),
-        (cx1, cy1, dx1, dy1, cx3, cy3, dx3, dy3)
-    ]
-
-    # Stores all intersections
+    # Compute intersections across ALL pairs in current frame
     intersections = []
+    for i in range(len(current_rays)):
+        for j in range(i + 1, len(current_rays)):
+            x1, y1, ddx1, ddy1 = current_rays[i]
+            x2, y2, ddx2, ddy2 = current_rays[j]
 
-    # Calculates each intersection and stores them
-    for (x1, y1, ddx1, ddy1, x2, y2, ddx2, ddy2) in pairs:
-        # We need to find t where:  origin1 + t1dir1 = origin2 + t2dir2
-        # Rearranged into a 2x2 linear system A * [t1, t2] = B so we can use np.linalg
-        A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
-        B = np.array([x2 - x1, y2 - y1])
+            v1 = np.array([ddx1, ddy1])
+            v2 = np.array([ddx2, ddy2])
+            cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
 
-        
-        v1 = np.array([ddx1, ddy1])
-        v2 = np.array([ddx2, ddy2])
+            if abs(cos_theta) > np.cos(np.deg2rad(2)):
+                continue
 
-        cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+            A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
+            B = np.array([x2 - x1, y2 - y1])
 
-        if abs(cos_theta) > np.cos(np.deg2rad(2)):
-            # angle between lines < 2 degrees
-            continue
+            try:
+                t1, _ = np.linalg.solve(A, B)
+            except np.linalg.LinAlgError:
+                continue
 
-        # Calculates t
-        t1, _ = np.linalg.solve(A, B)
+            intersectionX = x1 + t1 * ddx1
+            intersectionY = y1 + t1 * ddy1
+            intersections.append((intersectionX, intersectionY))
 
-        # Parametric equations to calculate intersection point
-        intersectionX = x1 + t1 * ddx1
-        intersectionY = y1 + t1 * ddy1
-
-        eye_center = (int(intersectionX), int(intersectionY))
-
-        intersections.append(eye_center)
-
-        # Adds the new ray(s) for this frame to the list
-        line1 = ((int(x1), int(y1)), eye_center)
-        line2 = ((int(x2), int(y2)), eye_center)
-        if line1 not in rays:
-            rays.append(line1)
-        if line2 not in rays:
-            rays.append(line2)
-
-    # Keeps list of rays 10 at most
-    if len(rays) > 10:
-        rays = rays[-10:]
-
-    # Visualizes up to 10 rays in each frame from center of each ellipse to intersection
-    for ellipse_center, intersection in rays:
-        cv2.line(frame, ellipse_center, intersection, (255, 0, 255), 1)
-
-    # Every line was parallel
     if not intersections:
         return None
 
-    # Returns average of all intersections from 3 rays
     avg_x = int(np.mean([pt[0] for pt in intersections]))
     avg_y = int(np.mean([pt[1] for pt in intersections]))
-    
-    return (avg_x, avg_y)
+
+    est_center = (avg_x, avg_y)
+
+    # Draw rays from each ellipse center to estimated eye center
+    for (cx, cy, _, __) in current_rays:
+        line = ((int(cx), int(cy)), est_center)
+        if line not in rays:
+            rays.append(line)
+
+    if len(rays) > 10:
+        rays = rays[-10:]
+
+    for ellipse_center, intersection in rays:
+        cv2.line(frame, ellipse_center, intersection, (255, 0, 255), 1)
+
+    return est_center
 
 
 # Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
@@ -466,7 +442,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         cv2.circle(test_frame, (x+w, y+(h//2)), 3, (255, 255, 255), -1)
         '''
         frame_height, frame_width = frame.shape[0:2]
-        boundary_center = (frame_width//2, frame_height//2)
+        boundary_center = (frame_width//2 - 100, frame_height//2 - 100)
         boundary_radius = int(frame_height * 0.5)
         cv2.circle(test_frame, boundary_center, boundary_radius, (255, 0, 255), 2)
 
@@ -474,18 +450,20 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         #Storing information from each pupil ellipse
         (center_x, center_y), (majorAxis_len, _), ellipse_angle = ellipse
 
-        if counter % 3 == 0: 
-            ellipses[0] = [center_x, center_y, ellipse_angle]
-        elif counter % 3 == 1:
-            ellipses[1] = [center_x, center_y, ellipse_angle]
-        else:
-            ellipses[2] = [center_x, center_y, ellipse_angle]
+        # if counter % 3 == 0: 
+        #     ellipses[0] = [center_x, center_y, ellipse_angle]
+        # elif counter % 3 == 1:
+        #     ellipses[1] = [center_x, center_y, ellipse_angle]
+        # else:
+        #     ellipses[2] = [center_x, center_y, ellipse_angle]
+
+        ellipses[counter % 10] = [center_x, center_y, ellipse_angle]
 
         #checks for if there has been at least 3 frames
         if counter >= 2:
             #finds eye center estimate from 3 most recent frames
             eye_center = eyecenter_estimation(ellipses, test_frame)
-            #updates list of past 100 eye center estimates
+            #updates list of past 1500 eye center estimates
             if eye_center is not None:
                 d_squared = (eye_center[0] - boundary_center[0])**2 + (eye_center[1] - boundary_center[1])**2
                 if d_squared < boundary_radius**2:
@@ -666,7 +644,7 @@ def process_video(video_path, input_method):
 def select_video():
     root = tk.Tk()
     root.withdraw()  # Hide the main window
-    video_path = 'eye_test.mp4'
+    video_path = 'eye_test_custom.mp4'
     if not os.path.exists(video_path):
         print("No file found at hardcoded path. Please select a video file.")
         video_path = filedialog.askopenfilename(title="Select Video File", filetypes=[("Video Files", "*.mp4;*.avi")])
