@@ -371,8 +371,6 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)  # Draw eye sphere (circle)
     cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Draw eye center
 
-
-
     if final_rotated_rect is not None and center_x is not None and center_y is not None:
         cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
         
@@ -403,7 +401,11 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     #cv2.circle(frame, (center_x, center_y), 22, (255, 255, 0), -1)  # Draw intersection center
 
     # Call the function
-    center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
+    # TODO: CHANGE THIS LATER WHEN WE HAVE THE GAZE VECTOR FOR THE LEFT AND RIGHT
+    lCenter, lDirection = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
+    rCenter, rDirection = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
+
+    intersectionPoint = compute_gaze_intersection(lCenter, lDirection, rCenter, rDirection)
 
     if center is not None and direction is not None:
         origin_text = f"Origin: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})"
@@ -436,6 +438,53 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             cv2.imshow("Eye Tracker + Sphere", blended)
 
     return final_rotated_rect
+
+
+def compute_gaze_intersection(left_eye_center, left_gaze_dir, right_eye_center, right_gaze_dir):
+    """
+    Finds the 3D point where two gaze vectors are closest to intersecting.
+    
+    Args:
+        left_eye_center: (np.ndarray) 3D origin of the left eye sphere
+        left_gaze_dir: (np.ndarray) Normalized 3D direction vector for left eye
+        right_eye_center: (np.ndarray) 3D origin of the right eye sphere
+        right_gaze_dir: (np.ndarray) Normalized 3D direction vector for right eye
+        
+    Returns:
+        np.ndarray: The estimated 3D gaze point in world space
+    """
+    # Vector connecting the two eye origins
+    origin_delta = left_eye_center - right_eye_center
+    
+    # Pre-calculate dot products for the linear system
+    # These represent the geometric relationship between the two rays
+    dot_left_left = np.dot(left_gaze_dir, left_gaze_dir)   # Usually 1.0 if normalized
+    dot_left_right = np.dot(left_gaze_dir, right_gaze_dir)
+    dot_right_right = np.dot(right_gaze_dir, right_gaze_dir) # Usually 1.0 if normalized
+    
+    dot_left_delta = np.dot(left_gaze_dir, origin_delta)
+    dot_right_delta = np.dot(right_gaze_dir, origin_delta)
+    
+    # The denominator represents the angular difference between the eyes
+    # If the eyes are perfectly parallel, the denominator becomes 0
+    denominator = dot_left_left * dot_right_right - dot_left_right * dot_left_right
+    
+    if abs(denominator) < 1e-6:
+        # Fallback: If eyes are parallel, assume they are looking at a distant point
+        return (left_eye_center + right_eye_center) / 2 + left_gaze_dir * 1000 
+
+    # Calculate the distance scalars along each ray to the point of closest approach
+    dist_left = (dot_left_right * dot_right_delta - dot_right_right * dot_left_delta) / denominator
+    dist_right = (dot_left_left * dot_right_delta - dot_left_right * dot_left_delta) / denominator
+    
+    # Calculate the specific 3D coordinates on each ray
+    closest_point_left = left_eye_center + dist_left * left_gaze_dir
+    closest_point_right = right_eye_center + dist_right * right_gaze_dir
+    
+    # The final gaze point is the average of the two closest points
+    gaze_point_3d = (closest_point_left + closest_point_right) / 2
+    
+    return gaze_point_3d
 
 def update_and_average_point(point_list, new_point, N):
     """
