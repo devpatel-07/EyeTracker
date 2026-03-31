@@ -427,6 +427,37 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         print(f"Gaze Direction:  ({direction[0]:.3f}, {direction[1]:.3f}, {direction[2]:.3f})")
     else:
         print("No valid intersection found.")
+    
+    if center is not None and direction is not None:
+        print(f"Sphere Center:   ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})")
+        print(f"Gaze Direction:  ({direction[0]:.3f}, {direction[1]:.3f}, {direction[2]:.3f})")
+        
+        # --- REAL SPACE PROJECTION ---
+        # Assumeq the eye is at an origin of (0, 6, 0) feet. (X=0 left/right, Y=6 feet high, Z=0 forward/back)
+        eye_height_feet = 6.0
+        real_origin = np.array([0.0, eye_height_feet, 0.0])
+
+        # direction is [dx, dy, dz]. OpenCV's Y-axis is typically inverted, but based on your 
+        # compute_gaze_vector math, Y is the vertical axis.
+        dy = direction[1]
+
+        if dy < 0: # User is looking downwards
+            # Find how far along the vector we need to go to hit the ground (Y=0)
+            t_distance = -eye_height_feet / dy
+            ground_point = real_origin + (t_distance * direction)
+            
+            # Distance calculated using Pythagorean theorem on the floor plane (X and Z)
+            floor_distance = math.sqrt(ground_point[0]**2 + ground_point[2]**2)
+            
+            print(f"--> Gaze hits the floor at: X={ground_point[0]:.2f} ft, Z={ground_point[2]:.2f} ft")
+            print(f"--> Distance from feet to gaze point: {floor_distance:.2f} ft")
+        else:
+            # User is looking straight ahead or up (will never hit the floor)
+            # Instead, let's project the gaze 10 feet out into the air
+            t_distance = 10.0
+            point_in_space = real_origin + (t_distance * direction)
+            print(f"--> Point 10ft along gaze: X={point_in_space[0]:.2f} ft, Y={point_in_space[1]:.2f} ft, Z={point_in_space[2]:.2f} ft")
+        # -----------------------------
 
     cv2.imshow("Frame with Ellipse and Rays", frame)
 
