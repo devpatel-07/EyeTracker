@@ -223,7 +223,7 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     
     # Calculate the percentage of covered white pixels within the ellipse
     if ellipse_area == 0:
-        print("area was 0")
+        # print("area was 0")
         return ellipse_goodness  
     
     #percentage of covered pixels to number of pixels under area
@@ -264,12 +264,12 @@ class EyeTracker:
         self.name = name
         self.camera_position = np.array(camera_position_3d)
         
-        self.ellipses = [[0, 0, 0]] * 10 
+        self.ellipses = [[0, 0, 0]] * 60
         self.counter = 0                 
         self.eye_centers = []            
         self.rays = []                   
         self.indexCounter = 0            
-        self.arraySize = 1500
+        self.arraySize = 100
 
         self.prev_model_center_avg = (320, 240)
         self.max_observed_distance = 0  
@@ -278,6 +278,8 @@ class EyeTracker:
         # Build rays for all ellipses
         current_rays = []
         for (cx, cy, angle_deg) in self.ellipses:
+            if cx == 0 and cy == 0:
+                continue
             a = np.deg2rad(angle_deg)
             dx, dy = -np.sin(a), np.cos(a)
             current_rays.append((cx, cy, dx, dy))
@@ -470,33 +472,13 @@ class EyeTracker:
             
             #Storing information from each pupil ellipse
             (c_x, c_y), _, ellipse_angle = ellipse
-            self.ellipses[self.counter % 10] = [c_x, c_y, ellipse_angle]
+            self.ellipses[self.counter % 60] = [c_x, c_y, ellipse_angle]
 
             frame_height, frame_width = frame.shape[0:2]
-            boundary_center = (frame_width//2 - 100, frame_height//2 - 100)
-            boundary_radius = int(frame_height * 0.5)
-
-            #checks for if there has been at least 3 frames
-            if self.counter >= 2:
-                #finds eye center estimate from 3 most recent frames
-                eye_center = self.eyecenter_estimation(frame)
-                
-                #updates list of past 1500 eye center estimates
-                if eye_center is not None:
-                    d_squared = (eye_center[0] - boundary_center[0])**2 + (eye_center[1] - boundary_center[1])**2
-                    if d_squared < boundary_radius**2:
-                        if (len(self.eye_centers) < self.arraySize):
-                            self.eye_centers.append(eye_center)
-                        else:
-                            self.eye_centers[self.indexCounter % self.arraySize] = eye_center
-                            self.indexCounter += 1
-
-                #display average eye center estimate
-                if len(self.eye_centers) > 0:
-                    x_estimate = sum([x[0] for x in self.eye_centers if x]) // len(self.eye_centers)
-                    y_estimate = sum([y[1] for y in self.eye_centers if y]) // len(self.eye_centers)
-                    model_center_average = (x_estimate, y_estimate)
             
+            # Lock the eye center strictly to the middle of the frame
+            model_center_average = (frame_width // 2, frame_height // 2)
+
             #track frames
             self.counter += 1
 
@@ -569,6 +551,9 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
     while True:
         ret_l, frame_l = cap_left.read()
+
+        frame_l = cv2.rotate(frame_l, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
         
         if not ret_l:
             print("Video feed ended or disconnected.")
@@ -576,10 +561,12 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
         if mirror_mode:
             # We horizontally mirror the video to act as the right eye
-            frame_r = cv2.flip(frame_l, 1) 
+            frame_r = cv2.flip(frame_l, 1)
             ret_r = True
         else:
             ret_r, frame_r = cap_right.read()
+
+            frame_r = cv2.rotate(frame_r, cv2.ROTATE_90_CLOCKWISE)
             if not ret_r:
                 print("Right video feed ended.")
                 break
@@ -594,6 +581,7 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
         # Safely check if the data exists using 'is not None'
         if lCenter is not None and rCenter is not None:
             intersection_3d = compute_gaze_intersection(lCenter, lDirection, rCenter, rDirection)
+            print(intersection_3d)
             
             # --- UPDATE MATPLOTLIB 3D ---
             ax.clear()
@@ -652,8 +640,8 @@ def dual_selection_gui():
     ttk.Combobox(root, textvariable=selected_right, values=[str(c) for c in cameras]).pack()
 
     def start_cameras():
-        src_l = int(selected_left.get())
-        src_r = int(selected_right.get())
+        src_l = "http://10.159.75.81:8080?action=stream" # IP can change
+        src_r = "http://10.159.75.81:8081?action=stream" # IP can change
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
 
