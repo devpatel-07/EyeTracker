@@ -41,7 +41,8 @@ def crop_to_aspect_ratio(image, width=640, height=480):
     else:
         # Current image is too tall
         new_height = int(current_width / desired_ratio)
-        offset = (current_height - new_height) // 2
+        #offset =  (current_height - new_height) // 2
+        offset = 0
         cropped_img = image[offset:offset + new_height, :]
 
     return cv2.resize(cropped_img, (width, height))
@@ -506,10 +507,13 @@ class EyeTracker:
 
     # Finds the pupil in an individual frame and returns the center point
     def process_frame(self, frame):
+        frame = cv2.flip(frame, 0)
+
         # Crop and resize frame
-        frame = crop_to_aspect_ratio(frame)
+        #frame = crop_to_aspect_ratio(frame)
         
         # FLIP REMOVED: frame = cv2.flip(frame, 0) was causing the upside-down issue
+        
 
         #find the darkest point
         darkest_point = get_darkest_area(frame)
@@ -640,21 +644,21 @@ def dual_selection_gui():
     ttk.Combobox(root, textvariable=selected_right, values=[str(c) for c in cameras]).pack()
 
     def start_cameras():
-        src_l = "http://10.159.75.81:8080?action=stream" # IP can change
-        src_r = "http://10.159.75.81:8081?action=stream" # IP can change
+        src_l = "http://10.159.68.6:8080?action=stream" # IP can change
+        src_r = "http://10.159.68.6:8081?action=stream" # IP can change
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
 
     def start_videos():
-        src_l = filedialog.askopenfilename(title="Select LEFT Video", filetypes=[("Video", "*.mp4;*.avi")])
+        src_l = filedialog.askopenfilename(title="Select LEFT Video", filetypes=[("Video", "*.mp4")])
         if not src_l: return
-        src_r = filedialog.askopenfilename(title="Select RIGHT Video", filetypes=[("Video", "*.mp4;*.avi")])
+        src_r = filedialog.askopenfilename(title="Select RIGHT Video", filetypes=[("Video", "*.mp4")])
         if not src_r: return
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
         
     def start_mirrored_video():
-        src = filedialog.askopenfilename(title="Select Single Video to Mirror", filetypes=[("Video", "*.mp4;*.avi")])
+        src = filedialog.askopenfilename(title="Select Single Video to Mirror", filetypes=[("Video", "*.mp4")])
         if not src: return
         root.destroy()
         run_dual_tracking(src_left=src, mirror_mode=True)
