@@ -1,660 +1,673 @@
-"""
-Optimized dual eye tracker.
-
-Key performance improvements vs. the original:
-  1. Threaded frame grabbers per camera/stream with a 1-slot queue so we always
-     process the LATEST frame and drop stale ones (kills MJPEG buffer lag).
-  2. Left and right eyes processed in parallel on a ThreadPoolExecutor.
-  3. `get_darkest_area` replaced with a single cv2.boxFilter + minMaxLoc call
-     (was a Python double loop -- typically 50-100x faster).
-  4. `optimize_contours_by_angle` fully vectorized with NumPy.
-  5. Single grayscale + single darkest-point lookup shared across the 3
-     threshold passes (was recomputed each time).
-  6. Ellipse ray history kept small and intersections computed with vectorized
-     NumPy instead of nested Python loops.
-  7. Matplotlib replaced with an OpenCV window for the 3D-ish gaze view --
-     matplotlib's interactive redraw was costing 100-300ms per frame.
-  8. cv2.setUseOptimized(True) and thread count hints.
-"""
-
 import cv2
+import random
+import math
 import numpy as np
-import threading
-import queue
-import time
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog
-from concurrent.futures import ThreadPoolExecutor
+import sys
+import time
+import matplotlib.pyplot as plt
 
-cv2.setUseOptimized(True)
 try:
-    cv2.setNumThreads(2)  # leave cores for our own threads
-except Exception:
-    pass
+    import gl_sphere
+    GL_SPHERE_AVAILABLE = True
+except ImportError:
+    GL_SPHERE_AVAILABLE = False
+    print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
 
-# ---------------------------------------------------------------------------
-# Threaded video capture -- always serves the freshest frame, drops backlog.
-# ---------------------------------------------------------------------------
-class FreshestFrameGrabber:
-    """Background thread that continuously reads from a VideoCapture and keeps
-    only the most recent frame. Prevents MJPEG/network buffer buildup."""
-
-    def __init__(self, source, name="cam"):
-        self.source = source
-        self.name = name
-        self.cap = cv2.VideoCapture(source)
-        # Small internal buffer so we don't accumulate latency.
-        try:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open source: {source}")
-
-        self._lock = threading.Lock()
-        self._latest = None
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        while self._running:
-            ok, frame = self.cap.read()
-            if not ok:
-                # Stream hiccup -- small sleep, try again. Don't spam.
-                time.sleep(0.005)
-                continue
-            with self._lock:
-                self._latest = frame
-
-    def read(self):
-        with self._lock:
-            if self._latest is None:
-                return False, None
-            # Return a shallow copy so the consumer can mutate freely while
-            # the grabber overwrites _latest.
-            return True, self._latest
-
-    def release(self):
-        self._running = False
-        self._thread.join(timeout=1.0)
-        self.cap.release()
-
-
-# ---------------------------------------------------------------------------
-# Fast image ops
-# ---------------------------------------------------------------------------
-def get_darkest_area_fast(gray):
-    """Find a small dark region using a box filter. One call instead of a
-    Python double loop. Returns (x, y) of the darkest 20x20 window center."""
-    # Blur the image with a 20x20 averaging filter; darkest pixel of the blur
-    # is the center of the darkest window.
-    blurred = cv2.boxFilter(gray, ddepth=-1, ksize=(20, 20),
-                            normalize=True, borderType=cv2.BORDER_REPLICATE)
-    # Ignore a border so we don't pick up frame edges.
-    b = 20
-    h, w = blurred.shape
-    roi = blurred[b:h - b, b:w - b]
-    _, _, min_loc, _ = cv2.minMaxLoc(roi)
-    return (min_loc[0] + b, min_loc[1] + b)
-
-
-def mask_outside_square(image, center, size):
-    """Zero everything outside a square centered at `center`."""
-    x, y = center
-    half = size // 2
-    h, w = image.shape[:2]
-    x1, y1 = max(0, x - half), max(0, y - half)
-    x2, y2 = min(w, x + half), min(h, y + half)
-    out = np.zeros_like(image)
-    out[y1:y2, x1:x2] = image[y1:y2, x1:x2]
-    return out
-
-
-def optimize_contours_by_angle_fast(contour):
-    """Vectorized version of the original angle-filter. `contour` is an
-    (N, 1, 2) or (N, 2) array of points from cv2.findContours."""
-    pts = contour.reshape(-1, 2).astype(np.float32)
-    n = len(pts)
-    if n < 10:
-        return contour
-
-    spacing = max(1, n // 25)
-    prev_pts = np.roll(pts, spacing, axis=0)
-    next_pts = np.roll(pts, -spacing, axis=0)
-
-    vec1 = prev_pts - pts
-    vec2 = next_pts - pts
-
-    centroid = pts.mean(axis=0)
-    vec_to_centroid = centroid - pts
-    mid = (vec1 + vec2) * 0.5
-
-    # Keep points whose (vec1+vec2)/2 points roughly toward the centroid.
-    cos_thresh = np.cos(np.radians(60))
-    keep = (vec_to_centroid * mid).sum(axis=1) >= cos_thresh
-
-    filtered = pts[keep]
-    if len(filtered) < 5:
-        return contour
-    return filtered.astype(np.int32).reshape(-1, 1, 2)
-
-
-def filter_largest_valid_contour(contours, pixel_thresh=1000, ratio_thresh=3.0):
-    """Largest-area contour that isn't super elongated."""
-    best = None
-    best_area = 0
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < pixel_thresh or area <= best_area:
-            continue
-        x, y, w, h = cv2.boundingRect(c)
-        if h == 0 or w == 0:
-            continue
-        ratio = max(w / h, h / w)
-        if ratio > ratio_thresh:
-            continue
-        best = c
-        best_area = area
-    return best
-
-
-def check_ellipse_goodness(binary_image, contour):
-    """Score: fraction of white pixels inside the fitted ellipse."""
-    if len(contour) < 5:
-        return 0.0
-    ellipse = cv2.fitEllipse(contour)
-    mask = np.zeros_like(binary_image)
-    cv2.ellipse(mask, ellipse, 255, -1)
-    ellipse_area = int(np.count_nonzero(mask))
-    if ellipse_area == 0:
-        return 0.0
-    covered = int(np.count_nonzero((binary_image == 255) & (mask == 255)))
-    return covered / ellipse_area
-
-
-def check_contour_pixels(contour, image_shape):
-    """How much of the contour actually lies under the fitted ellipse edge."""
-    if len(contour) < 5:
-        return (0, 0.0)
-    contour_mask = np.zeros(image_shape, dtype=np.uint8)
-    cv2.drawContours(contour_mask, [contour], -1, 255, 1)
-
-    ellipse = cv2.fitEllipse(contour)
-    thick = np.zeros(image_shape, dtype=np.uint8)
-    thin = np.zeros(image_shape, dtype=np.uint8)
-    cv2.ellipse(thick, ellipse, 255, 10)
-    cv2.ellipse(thin, ellipse, 255, 4)
-
-    overlap_thick = cv2.bitwise_and(contour_mask, thick)
-    overlap_thin = cv2.bitwise_and(contour_mask, thin)
-
-    total_border = int(np.count_nonzero(contour_mask))
-    if total_border == 0:
-        return (0, 0.0)
-    return (int(np.count_nonzero(overlap_thick)),
-            int(np.count_nonzero(overlap_thin)) / total_border)
-
-
-# ---------------------------------------------------------------------------
-# Eye tracker
-# ---------------------------------------------------------------------------
-class EyeTracker:
-    def __init__(self, name, camera_position_3d):
-        self.name = name
-        self.camera_position = np.array(camera_position_3d, dtype=np.float32)
-
-        # Rolling buffer of recent ellipses used to triangulate eye center.
-        # Columns: cx, cy, angle_deg, valid_flag.
-        self.HISTORY = 40
-        self.ellipses = np.zeros((self.HISTORY, 4), dtype=np.float32)
-        self.counter = 0
-
-        # Last drawn rays (for visualization).
-        self.rays = []
-
-        # Smoothed live eye-sphere center. Starts at frame center and gets
-        # EMA-updated every time we get a fresh estimate.
-        self.model_center_smooth = None  # np.array([x, y], float32)
-        self.EMA_ALPHA = 0.15            # higher = snappier, lower = smoother
-        self.MIN_RAYS = 6                # need at least this many ellipses
-        self.MIN_ANGLE_DEG = 3.0         # reject near-parallel ray pairs
-
-        self._kernel = np.ones((5, 5), np.uint8)
-
-    # ---- vectorized eye-center estimation from recent ellipses ----
-    def estimate_eye_center(self, frame_shape):
-        """Estimate the 2D eye-sphere center from the rolling buffer of
-        ellipse centers + minor-axis directions. Vectorized: no Python pair
-        loops. Returns (x, y) or None."""
-        mask = self.ellipses[:, 3] > 0.5
-        data = self.ellipses[mask]
-        if len(data) < self.MIN_RAYS:
-            return None
-
-        cx = data[:, 0]
-        cy = data[:, 1]
-        ang = np.deg2rad(data[:, 2])
-        # Perpendicular to the ellipse major axis direction (same as original).
-        dx = -np.sin(ang)
-        dy = np.cos(ang)
-
-        n = len(data)
-        # Build all unique pairs (i < j) with triu_indices.
-        i_idx, j_idx = np.triu_indices(n, k=1)
-
-        x1, y1 = cx[i_idx], cy[i_idx]
-        x2, y2 = cx[j_idx], cy[j_idx]
-        d1x, d1y = dx[i_idx], dy[i_idx]
-        d2x, d2y = dx[j_idx], dy[j_idx]
-
-        # Reject near-parallel ray pairs.
-        cos_theta = d1x * d2x + d1y * d2y
-        keep_ang = np.abs(cos_theta) < np.cos(np.deg2rad(self.MIN_ANGLE_DEG))
-        if not np.any(keep_ang):
-            return None
-
-        # Solve each 2x2 system [[d1x, -d2x],[d1y, -d2y]] * [t1, t2]^T = [dx, dy]
-        det = d1x * (-d2y) - (-d2x) * d1y  # = -d1x*d2y + d2x*d1y
-        rhs_x = x2 - x1
-        rhs_y = y2 - y1
-
-        valid = keep_ang & (np.abs(det) > 1e-6)
-        if not np.any(valid):
-            return None
-
-        t1 = np.empty_like(det)
-        t1[:] = np.nan
-        # t1 = ( (-d2y)*rhs_x - (-d2x)*rhs_y ) / det  = (-d2y*rhs_x + d2x*rhs_y)/det
-        t1[valid] = ((-d2y[valid]) * rhs_x[valid]
-                     - (-d2x[valid]) * rhs_y[valid]) / det[valid]
-
-        ix = x1 + t1 * d1x
-        iy = y1 + t1 * d1y
-
-        ix = ix[valid]
-        iy = iy[valid]
-
-        # Clip to frame bounds to kill wild outliers from parallel-ish rays.
-        h, w = frame_shape[:2]
-        in_bounds = (ix > -w) & (ix < 2 * w) & (iy > -h) & (iy < 2 * h)
-        ix = ix[in_bounds]
-        iy = iy[in_bounds]
-        if len(ix) < 3:
-            return None
-
-        # Robust center: median is far more stable than mean for this.
-        return float(np.median(ix)), float(np.median(iy))
-
-    # ---- core processing (runs on worker thread) ----
-    def process_frame(self, frame):
-        # Pre-rotation done by caller.
-        frame = cv2.flip(frame, 0)
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        darkest_point = get_darkest_area_fast(gray)
-        darkest_val = int(gray[darkest_point[1], darkest_point[0]])
-
-        # Build three thresholded images once each.
-        best_contour = None
-        best_score = 0.0
-        best_binary = None
-
-        for added in (5, 15, 25):
-            t = darkest_val + added
-            _, thr = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY_INV)
-            thr = mask_outside_square(thr, darkest_point, 250)
-            dilated = cv2.dilate(thr, self._kernel, iterations=2)
-
-            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-            cand = filter_largest_valid_contour(contours)
-            if cand is None or len(cand) < 6:
-                continue
-
-            goodness = check_ellipse_goodness(dilated, cand)
-            thick_count, thin_ratio = check_contour_pixels(cand, dilated.shape)
-            score = goodness * thick_count * thick_count * thin_ratio
-            if score > best_score:
-                best_score = score
-                best_contour = cand
-                best_binary = dilated
-
-        center_x = center_y = None
-        final_ellipse = None
-
-        if best_contour is not None:
-            refined = optimize_contours_by_angle_fast(best_contour)
-            if refined is not None and len(refined) >= 5:
-                final_ellipse = cv2.fitEllipse(refined)
-                (cx, cy), _, angle = final_ellipse
-                center_x, center_y = int(cx), int(cy)
-                # Store with valid=1 in the rolling buffer.
-                self.ellipses[self.counter % self.HISTORY] = [cx, cy, angle, 1.0]
-                self.counter += 1
-
-        h, w = frame.shape[:2]
-
-        # Live eye-sphere center: estimate from the rolling ellipse buffer,
-        # then smooth with an EMA so it updates frame-to-frame without jitter.
-        estimate = self.estimate_eye_center((h, w))
-        if estimate is not None:
-            est_arr = np.array(estimate, dtype=np.float32)
-            if self.model_center_smooth is None:
-                self.model_center_smooth = est_arr
-            else:
-                self.model_center_smooth = (
-                    (1.0 - self.EMA_ALPHA) * self.model_center_smooth
-                    + self.EMA_ALPHA * est_arr
-                )
-        elif self.model_center_smooth is None:
-            # Until we have enough samples, fall back to frame center.
-            self.model_center_smooth = np.array([w / 2.0, h / 2.0],
-                                                dtype=np.float32)
-
-        mcx = int(np.clip(self.model_center_smooth[0], 0, w - 1))
-        mcy = int(np.clip(self.model_center_smooth[1], 0, h - 1))
-        model_center = (mcx, mcy)
-
-        # Draw overlay.
-        locked = estimate is not None
-        sphere_color = (255, 50, 50) if locked else (120, 120, 120)
-        cv2.circle(frame, model_center, 202, sphere_color, 2)
-        cv2.circle(frame, model_center, 8, (255, 255, 0), -1)
-        if final_ellipse is not None and center_x is not None:
-            cv2.line(frame, model_center, (center_x, center_y),
-                     (255, 150, 50), 2)
-            cv2.ellipse(frame, final_ellipse, (20, 255, 255), 2)
-        status = "LIVE" if locked else f"warmup {int(self.ellipses[:,3].sum())}/{self.MIN_RAYS}"
-        cv2.putText(frame, f"{self.name}  [{status}]", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        if center_x is None:
-            return frame, None, None
-
-        sphere_center, gaze_dir = self.compute_gaze_vector(
-            center_x, center_y, model_center[0], model_center[1], w, h)
-        return frame, sphere_center, gaze_dir
-
-    # ---- gaze math (unchanged in spirit, tightened up) ----
-    def compute_gaze_vector(self, x, y, center_x, center_y,
-                            screen_width=640, screen_height=480):
-        fov_y_rad = np.radians(45.0)
-        aspect = screen_width / screen_height
-        far_clip = 100.0
-        cam = self.camera_position
-
-        half_h = np.tan(fov_y_rad / 2) * far_clip
-        half_w = half_h * aspect
-
-        ndc_x = (2.0 * x) / screen_width - 1.0
-        ndc_y = 1.0 - (2.0 * y) / screen_height
-        far_pt = np.array([ndc_x * half_w, ndc_y * half_h,
-                           cam[2] - far_clip], dtype=np.float32)
-
-        ray_dir = far_pt - cam
-        n = np.linalg.norm(ray_dir)
-        if n < 1e-8:
-            return None, None
-        ray_dir = -ray_dir / n
-
-        inner_radius = 1.0 / 1.05
-        off_x = (center_x / screen_width) * 2.0 - 1.0
-        off_y = 1.0 - (center_y / screen_height) * 2.0
-        sphere_center = np.array([off_x * 1.5, off_y * 1.5, 0.0],
-                                 dtype=np.float32) + cam
-
-        direction = -ray_dir
-        L = cam - sphere_center
-        a = float(np.dot(direction, direction))
-        b = float(2 * np.dot(direction, L))
-        c = float(np.dot(L, L) - inner_radius ** 2)
-        disc = b * b - 4 * a * c
-
-        if disc < 0:
-            t = -float(np.dot(direction, L)) / a
-        else:
-            sq = np.sqrt(disc)
-            t1 = (-b - sq) / (2 * a)
-            t2 = (-b + sq) / (2 * a)
-            candidates = [tv for tv in (t1, t2) if tv > 0]
-            if not candidates:
-                return None, None
-            t = min(candidates)
-
-        intersection = cam + t * direction
-        local = intersection - sphere_center
-        ln = np.linalg.norm(local)
-        if ln < 1e-8:
-            return None, None
-        target_dir = local / ln
-
-        circle_local = np.array([0.0, 0.0, inner_radius], dtype=np.float32)
-        circle_local /= np.linalg.norm(circle_local)
-
-        axis = np.cross(circle_local, target_dir)
-        an = np.linalg.norm(axis)
-        if an < 1e-6:
-            return sphere_center, circle_local
-        axis /= an
-        dot = float(np.clip(np.dot(circle_local, target_dir), -1.0, 1.0))
-        angle = np.arccos(dot)
-
-        cs, sn = np.cos(angle), np.sin(angle)
-        tt = 1 - cs
-        xa, ya, za = axis
-        R = np.array([
-            [tt * xa * xa + cs,      tt * xa * ya - sn * za, tt * xa * za + sn * ya],
-            [tt * xa * ya + sn * za, tt * ya * ya + cs,      tt * ya * za - sn * xa],
-            [tt * xa * za - sn * ya, tt * ya * za + sn * xa, tt * za * za + cs],
-        ], dtype=np.float32)
-
-        gaze = R @ np.array([0.0, 0.0, inner_radius], dtype=np.float32)
-        gn = np.linalg.norm(gaze)
-        if gn < 1e-8:
-            return sphere_center, circle_local
-        return sphere_center, gaze / gn
-
-
-# ---------------------------------------------------------------------------
-# Gaze intersection
-# ---------------------------------------------------------------------------
-def compute_gaze_intersection(lc, ld, rc, rd):
-    delta = lc - rc
-    dll = np.dot(ld, ld)
-    dlr = np.dot(ld, rd)
-    drr = np.dot(rd, rd)
-    dld = np.dot(ld, delta)
-    drd = np.dot(rd, delta)
-    denom = dll * drr - dlr * dlr
-    if abs(denom) < 1e-6:
-        return (lc + rc) * 0.5 + ld * 1000.0
-    t_l = (dlr * drd - drr * dld) / denom
-    t_r = (dll * drd - dlr * dld) / denom
-    p_l = lc + t_l * ld
-    p_r = rc + t_r * rd
-    return (p_l + p_r) * 0.5
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
-    grab_l = FreshestFrameGrabber(src_left, "left")
-    grab_r = None if mirror_mode else FreshestFrameGrabber(src_right, "right")
-
-    tracker_left = EyeTracker("Left Eye", [-0.1, 0.0, 3.0])
-    tracker_right = EyeTracker("Right Eye", [0.1, 0.0, 3.0])
-
-    pool = ThreadPoolExecutor(max_workers=2)
-
-    # Small OpenCV window for the 3D-ish view instead of matplotlib.
-    viz = np.zeros((400, 400, 3), dtype=np.uint8)
-
-    # FPS tracking.
-    fps_t0 = time.time()
-    fps_frames = 0
-    fps = 0.0
-
-    try:
-        while True:
-            ok_l, frame_l = grab_l.read()
-            if not ok_l or frame_l is None:
-                time.sleep(0.002)
-                continue
-
-            frame_l_rot = cv2.rotate(frame_l, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-            if mirror_mode:
-                frame_r_rot = cv2.flip(frame_l_rot, 1)
-            else:
-                ok_r, frame_r = grab_r.read()
-                if not ok_r or frame_r is None:
-                    time.sleep(0.002)
-                    continue
-                frame_r_rot = cv2.rotate(frame_r, cv2.ROTATE_90_CLOCKWISE)
-
-            # Run both eyes in parallel.
-            fut_l = pool.submit(tracker_left.process_frame, frame_l_rot)
-            fut_r = pool.submit(tracker_right.process_frame, frame_r_rot)
-            out_l, lCenter, lDir = fut_l.result()
-            out_r, rCenter, rDir = fut_r.result()
-
-            # Overlay FPS on left feed.
-            fps_frames += 1
-            if fps_frames >= 10:
-                now = time.time()
-                fps = fps_frames / (now - fps_t0)
-                fps_t0 = now
-                fps_frames = 0
-            cv2.putText(out_l, f"{fps:5.1f} FPS", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-            cv2.imshow("Left Eye Feed", out_l)
-            cv2.imshow("Right Eye Feed", out_r)
-
-            # Lightweight 3D-ish viz (top-down XZ + side YZ).
-            if lCenter is not None and rCenter is not None:
-                inter = compute_gaze_intersection(lCenter, lDir, rCenter, rDir)
-                viz[:] = 0
-
-                def to_screen(p, ox, oy, scale=60):
-                    return (int(ox + p[0] * scale), int(oy - p[2] * scale))
-
-                # Top-down panel (X vs Z) on left half.
-                cv2.putText(viz, "Top (X,Z)", (10, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                lp = to_screen(lCenter, 100, 200)
-                rp = to_screen(rCenter, 100, 200)
-                ip = to_screen(inter, 100, 200)
-                cv2.line(viz, lp, ip, (0, 0, 255), 1)
-                cv2.line(viz, rp, ip, (255, 0, 0), 1)
-                cv2.circle(viz, lp, 4, (0, 0, 255), -1)
-                cv2.circle(viz, rp, 4, (255, 0, 0), -1)
-                cv2.circle(viz, ip, 5, (0, 255, 0), -1)
-
-                # Side panel (Y vs Z) on right half.
-                cv2.putText(viz, "Side (Y,Z)", (210, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-                def to_screen_side(p, ox, oy, scale=60):
-                    return (int(ox + p[1] * scale), int(oy - p[2] * scale))
-
-                lp = to_screen_side(lCenter, 300, 200)
-                rp = to_screen_side(rCenter, 300, 200)
-                ip = to_screen_side(inter, 300, 200)
-                cv2.line(viz, lp, ip, (0, 0, 255), 1)
-                cv2.line(viz, rp, ip, (255, 0, 0), 1)
-                cv2.circle(viz, lp, 4, (0, 0, 255), -1)
-                cv2.circle(viz, rp, 4, (255, 0, 0), -1)
-                cv2.circle(viz, ip, 5, (0, 255, 0), -1)
-
-                cv2.putText(viz,
-                            f"gaze: ({inter[0]:+.2f},{inter[1]:+.2f},{inter[2]:+.2f})",
-                            (10, 380), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (0, 255, 0), 1)
-                cv2.imshow("3D Gaze", viz)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord(' '):
-                cv2.waitKey(0)
-    finally:
-        pool.shutdown(wait=False)
-        grab_l.release()
-        if grab_r is not None:
-            grab_r.release()
-        cv2.destroyAllWindows()
-
-
-# ---------------------------------------------------------------------------
-# Camera detection + GUI
-# ---------------------------------------------------------------------------
+# Function to detect available cameras
 def detect_cameras(max_cams=10):
-    avail = []
+    available_cameras = []
     for i in range(max_cams):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         if cap.isOpened():
-            avail.append(i)
+            available_cameras.append(i)
             cap.release()
-    return avail
+    return available_cameras
 
+# Crop the image to maintain a specific aspect ratio (width:height) before resizing.
+def crop_to_aspect_ratio(image, width=640, height=480):
+    current_height, current_width = image.shape[:2]
+    desired_ratio = width / height
+    current_ratio = current_width / current_height
+
+    if current_ratio > desired_ratio:
+        # Current image is too wide
+        new_width = int(desired_ratio * current_height)
+        offset = (current_width - new_width) // 2
+        cropped_img = image[:, offset:offset + new_width]
+    else:
+        # Current image is too tall
+        new_height = int(current_width / desired_ratio)
+        #offset =  (current_height - new_height) // 2
+        offset = 0
+        cropped_img = image[offset:offset + new_height, :]
+
+    return cv2.resize(cropped_img, (width, height))
+
+# Apply thresholding to an image
+def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
+    threshold = darkestPixelValue + addedThreshold
+    _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
+    return thresholded_image
+
+# Finds a square area of dark pixels in the image
+def get_darkest_area(image):
+    ignoreBounds = 20
+    imageSkipSize = 10
+    searchArea = 20
+    internalSkipSize = 5
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    min_sum = float('inf')
+    darkest_point = None
+
+    for y in range(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize):
+        for x in range(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize):
+            current_sum = 0
+            num_pixels = 0
+            for dy in range(0, searchArea, internalSkipSize):
+                if y + dy >= gray.shape[0]:
+                    break
+                for dx in range(0, searchArea, internalSkipSize):
+                    if x + dx >= gray.shape[1]:
+                        break
+                    current_sum += gray[y + dy][x + dx]
+                    num_pixels += 1
+
+            if current_sum < min_sum and num_pixels > 0:
+                min_sum = current_sum
+                darkest_point = (x + searchArea // 2, y + searchArea // 2)
+
+    return darkest_point
+
+# Mask all pixels outside a square defined by center and size
+def mask_outside_square(image, center, size):
+    x, y = center
+    half_size = size // 2
+
+    mask = np.zeros_like(image)
+    top_left_x = max(0, x - half_size)
+    top_left_y = max(0, y - half_size)
+    bottom_right_x = min(image.shape[1], x + half_size)
+    bottom_right_y = min(image.shape[0], y + half_size)
+    mask[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 255
+    return cv2.bitwise_and(image, mask)
+
+def optimize_contours_by_angle(contours, image):
+    if len(contours) < 1:
+        return contours
+
+    # Holds the candidate points
+    all_contours = np.concatenate(contours[0], axis=0)
+    # Set spacing based on size of contours
+    spacing = int(len(all_contours)/25) 
+    # Temporary array for result
+    filtered_points = []
+    # Calculate centroid of the original contours
+    centroid = np.mean(all_contours, axis=0)
+    
+    # Loop through each point in the all_contours array
+    for i in range(0, len(all_contours), 1):
+        # Get three points: current point, previous point, and next point
+        current_point = all_contours[i]
+        prev_point = all_contours[i - spacing] if i - spacing >= 0 else all_contours[-spacing]
+        next_point = all_contours[i + spacing] if i + spacing < len(all_contours) else all_contours[spacing]
+        
+        # Calculate vectors between points
+        vec1 = prev_point - current_point
+        vec2 = next_point - current_point
+        
+        with np.errstate(invalid='ignore'):
+            # Calculate angles between vectors
+            angle = np.arccos(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+
+        # Calculate vector from current point to centroid
+        vec_to_centroid = centroid - current_point
+        # Calculate the cosine of the desired angle threshold (e.g., 80 degrees)
+        cos_threshold = np.cos(np.radians(60))  
+        
+        # Check if angle is oriented towards centroid
+        if np.dot(vec_to_centroid, (vec1+vec2)/2) >= cos_threshold:
+            filtered_points.append(current_point)
+    
+    return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
+
+# Returns the largest contour that is not extremely long or tall
+def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thresh):
+    max_area = 0
+    largest_contour = None
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area >= pixel_thresh:
+            x, y, w, h = cv2.boundingRect(contour)
+            length_to_width_ratio = max(w / h, h / w)
+            if length_to_width_ratio <= ratio_thresh:
+                if area > max_area:
+                    max_area = area
+                    largest_contour = contour
+
+    return [largest_contour] if largest_contour is not None else []
+
+#Fits an ellipse to the optimized contours and draws it on the image.
+def fit_and_draw_ellipses(image, optimized_contours, color):
+    if len(optimized_contours) >= 5:
+        # Ensure the data is in the correct shape (n, 1, 2) for cv2.fitEllipse
+        contour = np.array(optimized_contours, dtype=np.int32).reshape((-1, 1, 2))
+        # Fit ellipse
+        ellipse = cv2.fitEllipse(contour)
+        # Draw the ellipse
+        cv2.ellipse(image, ellipse, color, 2)  
+        return image
+    else:
+        print("Not enough points to fit an ellipse.")
+        return image
+
+#checks how many pixels in the contour fall under a slightly thickened ellipse
+#also returns that number of pixels divided by the total pixels on the contour border
+#assists with checking ellipse goodness    
+def check_contour_pixels(contour, image_shape, debug_mode_on):
+    # Check if the contour can be used to fit an ellipse (requires at least 5 points)
+    if len(contour) < 5:
+        return [0, 0]  
+    
+    # Create an empty mask for the contour
+    contour_mask = np.zeros(image_shape, dtype=np.uint8)
+    # Draw the contour on the mask, filling it
+    cv2.drawContours(contour_mask, [contour], -1, (255), 1)
+   
+    # Fit an ellipse to the contour and create a mask for the ellipse
+    ellipse_mask_thick = np.zeros(image_shape, dtype=np.uint8)
+    ellipse_mask_thin = np.zeros(image_shape, dtype=np.uint8)
+    ellipse = cv2.fitEllipse(contour)
+    
+    # Draw the ellipse with a specific thickness
+    cv2.ellipse(ellipse_mask_thick, ellipse, (255), 10) #capture more for absolute
+    cv2.ellipse(ellipse_mask_thin, ellipse, (255), 4) #capture fewer for ratio
+
+    # Calculate the overlap of the contour mask and the thickened ellipse mask
+    overlap_thick = cv2.bitwise_and(contour_mask, ellipse_mask_thick)
+    overlap_thin = cv2.bitwise_and(contour_mask, ellipse_mask_thin)
+    
+    # Count the number of non-zero (white) pixels in the overlap
+    absolute_pixel_total_thick = np.sum(overlap_thick > 0)
+    absolute_pixel_total_thin = np.sum(overlap_thin > 0)
+    
+    # Compute the ratio of pixels under the ellipse to the total pixels on the contour border
+    total_border_pixels = np.sum(contour_mask > 0)
+    ratio_under_ellipse = absolute_pixel_total_thin / total_border_pixels if total_border_pixels > 0 else 0
+    
+    return [absolute_pixel_total_thick, ratio_under_ellipse, overlap_thin]
+
+#outside of this method, select the ellipse with the highest percentage of pixels under the ellipse 
+def check_ellipse_goodness(binary_image, contour, debug_mode_on):
+    ellipse_goodness = [0,0,0] #covered pixels, edge straightness stdev, skewedness   
+    # Check if the contour can be used to fit an ellipse (requires at least 5 points)
+    if len(contour) < 5:
+        print("length of contour was 0")
+        return 0  
+    
+    # Fit an ellipse to the contour
+    ellipse = cv2.fitEllipse(contour)
+    # Create a mask with the same dimensions as the binary image, initialized to zero (black)
+    mask = np.zeros_like(binary_image)
+    # Draw the ellipse on the mask with white color (255)
+    cv2.ellipse(mask, ellipse, (255), -1)
+    
+    # Calculate the number of pixels within the ellipse
+    ellipse_area = np.sum(mask == 255)
+    # Calculate the number of white pixels within the ellipse
+    covered_pixels = np.sum((binary_image == 255) & (mask == 255))
+    
+    # Calculate the percentage of covered white pixels within the ellipse
+    if ellipse_area == 0:
+        # print("area was 0")
+        return ellipse_goodness  
+    
+    #percentage of covered pixels to number of pixels under area
+    ellipse_goodness[0] = covered_pixels / ellipse_area
+    #skew of the ellipse
+    axes_lengths = ellipse[1]  
+    ellipse_goodness[2] = min(ellipse[1][1]/ellipse[1][0], ellipse[1][0]/ellipse[1][1])
+    
+    return ellipse_goodness
+
+def compute_gaze_intersection(left_eye_center, left_gaze_dir, right_eye_center, right_gaze_dir):
+    origin_delta = left_eye_center - right_eye_center
+    
+    dot_left_left = np.dot(left_gaze_dir, left_gaze_dir)   
+    dot_left_right = np.dot(left_gaze_dir, right_gaze_dir)
+    dot_right_right = np.dot(right_gaze_dir, right_gaze_dir) 
+    
+    dot_left_delta = np.dot(left_gaze_dir, origin_delta)
+    dot_right_delta = np.dot(right_gaze_dir, origin_delta)
+    
+    denominator = dot_left_left * dot_right_right - dot_left_right * dot_left_right
+    
+    if abs(denominator) < 1e-6:
+        return (left_eye_center + right_eye_center) / 2 + left_gaze_dir * 1000 
+
+    dist_left = (dot_left_right * dot_right_delta - dot_right_right * dot_left_delta) / denominator
+    dist_right = (dot_left_left * dot_right_delta - dot_left_right * dot_left_delta) / denominator
+    
+    closest_point_left = left_eye_center + dist_left * left_gaze_dir
+    closest_point_right = right_eye_center + dist_right * right_gaze_dir
+    
+    gaze_point_3d = (closest_point_left + closest_point_right) / 2
+    
+    return gaze_point_3d
+
+class EyeTracker:
+    def __init__(self, name, camera_position_3d):
+        self.name = name
+        self.camera_position = np.array(camera_position_3d)
+        
+        self.ellipses = [[0, 0, 0]] * 60
+        self.counter = 0                 
+        self.eye_centers = []            
+        self.rays = []                   
+        self.indexCounter = 0            
+        self.arraySize = 100
+
+        self.prev_model_center_avg = (320, 240)
+        self.max_observed_distance = 0  
+
+    def eyecenter_estimation(self, frame):
+        # Build rays for all ellipses
+        current_rays = []
+        for (cx, cy, angle_deg) in self.ellipses:
+            if cx == 0 and cy == 0:
+                continue
+            a = np.deg2rad(angle_deg)
+            dx, dy = -np.sin(a), np.cos(a)
+            current_rays.append((cx, cy, dx, dy))
+
+        # Compute intersections across ALL pairs in current frame
+        intersections = []
+        for i in range(len(current_rays)):
+            for j in range(i + 1, len(current_rays)):
+                x1, y1, ddx1, ddy1 = current_rays[i]
+                x2, y2, ddx2, ddy2 = current_rays[j]
+
+                v1 = np.array([ddx1, ddy1])
+                v2 = np.array([ddx2, ddy2])
+                cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+                if abs(cos_theta) > np.cos(np.deg2rad(2)):
+                    continue
+
+                A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
+                B = np.array([x2 - x1, y2 - y1])
+
+                try:
+                    t1, _ = np.linalg.solve(A, B)
+                except np.linalg.LinAlgError:
+                    continue
+
+                intersectionX = x1 + t1 * ddx1
+                intersectionY = y1 + t1 * ddy1
+                intersections.append((intersectionX, intersectionY))
+
+        if not intersections:
+            return None
+
+        avg_x = int(np.mean([pt[0] for pt in intersections]))
+        avg_y = int(np.mean([pt[1] for pt in intersections]))
+
+        est_center = (avg_x, avg_y)
+
+        # Draw rays from each ellipse center to estimated eye center
+        for (cx, cy, _, __) in current_rays:
+            line = ((int(cx), int(cy)), est_center)
+            if line not in self.rays:
+                self.rays.append(line)
+
+        if len(self.rays) > 10:
+            self.rays = self.rays[-10:]
+
+        for ellipse_center, intersection in self.rays:
+            cv2.line(frame, ellipse_center, intersection, (255, 0, 255), 1)
+
+        return est_center
+
+    def compute_gaze_vector(self, x, y, center_x, center_y, screen_width=640, screen_height=480):
+        viewport_width = screen_width
+        viewport_height = screen_height
+        fov_y_deg = 45.0
+        aspect_ratio = viewport_width / viewport_height
+        far_clip = 100.0
+
+        camera_position = self.camera_position
+
+        fov_y_rad = np.radians(fov_y_deg)
+        half_height_far = np.tan(fov_y_rad / 2) * far_clip
+        half_width_far = half_height_far * aspect_ratio
+
+        ndc_x = (2.0 * x) / viewport_width - 1.0
+        ndc_y = 1.0 - (2.0 * y) / viewport_height
+
+        far_x = ndc_x * half_width_far
+        far_y = ndc_y * half_height_far
+        far_z = camera_position[2] - far_clip
+        far_point = np.array([far_x, far_y, far_z])
+
+        ray_origin = camera_position
+        ray_direction = far_point - camera_position
+        ray_direction /= np.linalg.norm(ray_direction)
+        ray_direction = -ray_direction
+
+        inner_radius = 1.0 / 1.05
+        sphere_offset_x = (center_x / screen_width) * 2.0 - 1.0
+        sphere_offset_y = 1.0 - (center_y / screen_height) * 2.0
+        sphere_center = np.array([sphere_offset_x * 1.5, sphere_offset_y * 1.5, 0.0]) + camera_position
+
+        origin = ray_origin
+        direction = -ray_direction
+        L = origin - sphere_center
+
+        a = np.dot(direction, direction)
+        b = 2 * np.dot(direction, L)
+        c = np.dot(L, L) - inner_radius**2
+
+        discriminant = b**2 - 4 * a * c
+        if discriminant < 0:
+            t = -np.dot(direction, L) / np.dot(direction, direction)
+            intersection_point = origin + t * direction
+            intersection_local = intersection_point - sphere_center
+            target_direction = intersection_local / np.linalg.norm(intersection_local)
+        else:
+            sqrt_disc = np.sqrt(discriminant)
+            t1 = (-b - sqrt_disc) / (2 * a)
+            t2 = (-b + sqrt_disc) / (2 * a)
+
+            t = None
+            if t1 > 0 and t2 > 0:
+                t = min(t1, t2)
+            elif t1 > 0:
+                t = t1
+            elif t2 > 0:
+                t = t2
+            if t is None:
+                return None, None
+
+        intersection_point = origin + t * direction
+        intersection_local = intersection_point - sphere_center
+        target_direction = intersection_local / np.linalg.norm(intersection_local)
+
+        circle_local_center = np.array([0.0, 0.0, inner_radius])
+        circle_local_center /= np.linalg.norm(circle_local_center)
+
+        rotation_axis = np.cross(circle_local_center, target_direction)
+        rotation_axis_norm = np.linalg.norm(rotation_axis)
+        if rotation_axis_norm < 1e-6:
+            return sphere_center, circle_local_center
+
+        rotation_axis /= rotation_axis_norm
+        dot = np.dot(circle_local_center, target_direction)
+        dot = np.clip(dot, -1.0, 1.0)
+        angle_rad = np.arccos(dot)
+
+        c = np.cos(angle_rad)
+        s = np.sin(angle_rad)
+        t_ = 1 - c
+        x_, y_, z_ = rotation_axis
+
+        rotation_matrix = np.array([
+            [t_*x_*x_ + c, t_*x_*y_ - s*z_, t_*x_*z_ + s*y_],
+            [t_*x_*y_ + s*z_, t_*y_*y_ + c, t_*y_*z_ - s*x_],
+            [t_*x_*z_ - s*y_, t_*y_*z_ + s*x_, t_*z_*z_ + c]
+        ])
+
+        gaze_local = np.array([0.0, 0.0, inner_radius])
+        gaze_rotated = rotation_matrix @ gaze_local
+        gaze_rotated /= np.linalg.norm(gaze_rotated)
+
+        return sphere_center, gaze_rotated
+
+    # Process frames for pupil detection
+    def process_frames(self, thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point):
+        kernel_size = 5
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+
+        image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] 
+        final_contours = [] 
+        goodness = 0 
+        final_goodness = 0
+        
+        #initialize variables
+        center_x, center_y = None, None
+
+        #iterate through binary images and see which fits the ellipse best
+        for i in range(1,4):
+            # Dilate the binary image
+            dilated_image = cv2.dilate(image_array[i-1], kernel, iterations=2)#medium
+            
+            # Find contours
+            contours, _ = cv2.findContours(dilated_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            reduced_contours = filter_contours_by_area_and_return_largest(contours, 1000, 3)
+
+            if len(reduced_contours) > 0 and len(reduced_contours[0]) > 5:
+                current_goodness = check_ellipse_goodness(dilated_image, reduced_contours[0], False)
+                ellipse = cv2.fitEllipse(reduced_contours[0])
+                center_x, center_y = map(int, ellipse[0]) 
+                    
+                #in total pixels, first element is pixel total, next is ratio
+                total_pixels = check_contour_pixels(reduced_contours[0], dilated_image.shape, False)                 
+                final_goodness = current_goodness[0]*total_pixels[0]*total_pixels[0]*total_pixels[1]
+
+            if final_goodness > 0 and final_goodness > goodness: 
+                goodness = final_goodness
+                final_contours = reduced_contours
+
+        final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
+        
+        final_rotated_rect = None
+        model_center_average = (320, 240)
+
+        if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0]) > 5:
+            ellipse = cv2.fitEllipse(final_contours[0])
+            final_rotated_rect = ellipse
+            
+            #Storing information from each pupil ellipse
+            (c_x, c_y), _, ellipse_angle = ellipse
+            self.ellipses[self.counter % 60] = [c_x, c_y, ellipse_angle]
+
+            frame_height, frame_width = frame.shape[0:2]
+            
+            # Lock the eye center strictly to the middle of the frame
+            model_center_average = (frame_width // 2, frame_height // 2)
+
+            #track frames
+            self.counter += 1
+
+        if model_center_average[0] == 320:
+            model_center_average = self.prev_model_center_avg
+        if model_center_average[0] != 0:
+            self.prev_model_center_avg = model_center_average
+        
+        # Example safety check
+        if center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
+            return None, None
+
+        # Draw reference lines/ellipses
+        cv2.circle(frame, model_center_average, int(202), (255, 50, 50), 2)  # Draw eye sphere (circle)
+        cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Draw eye center
+
+        if final_rotated_rect is not None:
+            cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
+            cv2.ellipse(frame, final_rotated_rect, (20, 255, 255), 2) #draw final ellipse on image
+
+        cv2.putText(frame, self.name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.imshow(f"{self.name} Feed", frame)
+
+        return self.compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
+
+    # Finds the pupil in an individual frame and returns the center point
+    def process_frame(self, frame):
+        frame = cv2.flip(frame, 0)
+
+        # Crop and resize frame
+        #frame = crop_to_aspect_ratio(frame)
+        
+        # FLIP REMOVED: frame = cv2.flip(frame, 0) was causing the upside-down issue
+        
+
+        #find the darkest point
+        darkest_point = get_darkest_area(frame)
+
+        # Convert to grayscale to handle pixel value operations
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
+        
+        # apply thresholding operations at different levels
+        # at least one should give us a good ellipse segment
+        thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, 5)#lite
+        thresholded_image_strict = mask_outside_square(thresholded_image_strict, darkest_point, 250)
+
+        thresholded_image_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, 15)#medium
+        thresholded_image_medium = mask_outside_square(thresholded_image_medium, darkest_point, 250)
+        
+        thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, 25)#heavy
+        thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
+        
+        #take the three images thresholded at different levels and process them
+        return self.process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point)
+
+
+def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
+    cap_left = cv2.VideoCapture(src_left)
+    
+    if not mirror_mode:
+        cap_right = cv2.VideoCapture(src_right)
+
+    tracker_left = EyeTracker(name="Left Eye", camera_position_3d=[-0.1, 0.0, 3.0])
+    tracker_right = EyeTracker(name="Right Eye", camera_position_3d=[0.1, 0.0, 3.0])
+
+    # --- Fixed eye positions (adjust after observing tracker output) ---
+    LEFT_EYE = np.array([-0.03, 0.0, 0.5])
+    RIGHT_EYE = np.array([0.03, 0.0, 0.5])
+
+    # --- SETUP MATPLOTLIB 3D ---
+    plt.ion()
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title("Real-Time 3D Gaze Vectors")
+    plt.show(block=False)
+
+    while True:
+        ret_l, frame_l = cap_left.read()
+
+        frame_l = cv2.rotate(frame_l, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if not ret_l:
+            print("Video feed ended or disconnected.")
+            break
+
+        if mirror_mode:
+            frame_r = cv2.flip(frame_l, 1)
+            ret_r = True
+        else:
+            ret_r, frame_r = cap_right.read()
+            frame_r = cv2.rotate(frame_r, cv2.ROTATE_90_CLOCKWISE)
+            if not ret_r:
+                print("Right video feed ended.")
+                break
+
+        left_data = tracker_left.process_frame(frame_l.copy())
+        right_data = tracker_right.process_frame(frame_r.copy())
+
+        lCenter, lDirection = left_data
+        rCenter, rDirection = right_data
+
+        if lCenter is not None and rCenter is not None:
+            # Use fixed eyes with tracked directions
+            intersection_3d = compute_gaze_intersection(LEFT_EYE, lDirection, RIGHT_EYE, rDirection)
+            print(intersection_3d)
+            
+            ax.clear()
+            
+            # Vectors from fixed eyes toward intersection
+            A = intersection_3d - LEFT_EYE
+            B = intersection_3d - RIGHT_EYE
+
+            # Draw gaze vectors
+            ax.quiver(*LEFT_EYE, *A, color='r', linewidth=2, label='Left Gaze')
+            ax.quiver(*RIGHT_EYE, *B, color='b', linewidth=2, label='Right Gaze')
+
+            # Draw points
+            ax.scatter(*LEFT_EYE, color='red', s=80, label='Left Eye')
+            ax.scatter(*RIGHT_EYE, color='blue', s=80, label='Right Eye')
+            ax.scatter(*intersection_3d, color='green', s=100, label='Intersection')
+
+            # Labels
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            
+            # Fixed limits — adjust to your tracker's coordinate range
+            ax.set_xlim(-0.1, 0.1)
+            ax.set_ylim(-0.2, 0)
+            ax.set_zlim(-1, 1)
+            
+            ax.legend()
+            
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord(' '):
+            cv2.waitKey(0)
+
+    cap_left.release()
+    if not mirror_mode:
+        cap_right.release()
+    cv2.destroyAllWindows()
+    plt.ioff()
+    plt.close(fig)
 
 def dual_selection_gui():
     cameras = detect_cameras()
     root = tk.Tk()
     root.title("Dual Eye Tracker Configuration")
+    
+    tk.Label(root, text="Left Eye Source:", font=("Arial", 10, "bold")).pack(pady=5)
+    selected_left = tk.StringVar(value=str(cameras[0]) if cameras else "0")
+    ttk.Combobox(root, textvariable=selected_left, values=[str(c) for c in cameras]).pack()
 
-    tk.Label(root, text="Left Eye Source:",
-             font=("Arial", 10, "bold")).pack(pady=5)
-    sel_l = tk.StringVar(value=str(cameras[0]) if cameras else "0")
-    ttk.Combobox(root, textvariable=sel_l,
-                 values=[str(c) for c in cameras]).pack()
+    tk.Label(root, text="Right Eye Source:", font=("Arial", 10, "bold")).pack(pady=5)
+    selected_right = tk.StringVar(value=str(cameras[1]) if len(cameras)>1 else "1")
+    ttk.Combobox(root, textvariable=selected_right, values=[str(c) for c in cameras]).pack()
 
-    tk.Label(root, text="Right Eye Source:",
-             font=("Arial", 10, "bold")).pack(pady=5)
-    sel_r = tk.StringVar(value=str(cameras[1]) if len(cameras) > 1 else "1")
-    ttk.Combobox(root, textvariable=sel_r,
-                 values=[str(c) for c in cameras]).pack()
-
-    def start_streams():
-        src_l = "http://10.42.0.1:8080?action=stream"
-        src_r = "http://10.42.0.1:8081?action=stream"
+    def start_cameras():
+        src_l = "http://10.42.0.1:8080?action=stream" # IP can change
+        src_r = "http://10.42.0.1:8081?action=stream" # IP can change
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
 
     def start_videos():
-        src_l = filedialog.askopenfilename(title="Select LEFT Video",
-                                           filetypes=[("Video", "*.mp4")])
-        if not src_l:
-            return
-        src_r = filedialog.askopenfilename(title="Select RIGHT Video",
-                                           filetypes=[("Video", "*.mp4")])
-        if not src_r:
-            return
+        src_l = filedialog.askopenfilename(title="Select LEFT Video", filetypes=[("Video", "*.mp4")])
+        if not src_l: return
+        src_r = filedialog.askopenfilename(title="Select RIGHT Video", filetypes=[("Video", "*.mp4")])
+        if not src_r: return
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
-
-    def start_mirrored():
-        src = filedialog.askopenfilename(title="Select Single Video to Mirror",
-                                         filetypes=[("Video", "*.mp4")])
-        if not src:
-            return
+        
+    def start_mirrored_video():
+        src = filedialog.askopenfilename(title="Select Single Video to Mirror", filetypes=[("Video", "*.mp4")])
+        if not src: return
         root.destroy()
         run_dual_tracking(src_left=src, mirror_mode=True)
 
-    tk.Button(root, text="Start 2 Streams",
-              command=start_streams).pack(pady=10)
-    tk.Button(root, text="Start 2 Videos",
-              command=start_videos).pack(pady=5)
-    tk.Button(root, text="Start 1 Video (Mirrored)",
-              command=start_mirrored, bg="lightblue").pack(pady=10)
+    tk.Button(root, text="Start 2 Webcams", command=start_cameras).pack(pady=10)
+    tk.Button(root, text="Start 2 Videos", command=start_videos).pack(pady=5)
+    tk.Button(root, text="Start 1 Video (Mirrored)", command=start_mirrored_video, bg="lightblue").pack(pady=10)
 
     root.mainloop()
-
 
 if __name__ == "__main__":
     dual_selection_gui()
