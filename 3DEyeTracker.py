@@ -205,11 +205,88 @@ class EyeTracker:
     def __init__(self, name, camera_position_3d):
         self.name = name
         self.camera_position = np.array(camera_position_3d, dtype=np.float32)
-        self.ellipses = np.zeros((60, 3), dtype=np.float32)
+
+        # Rolling buffer of recent ellipses used to triangulate eye center.
+        # Columns: cx, cy, angle_deg, valid_flag.
+        self.HISTORY = 40
+        self.ellipses = np.zeros((self.HISTORY, 4), dtype=np.float32)
         self.counter = 0
+
+        # Last drawn rays (for visualization).
         self.rays = []
-        self.prev_model_center_avg = (320, 240)
+
+        # Smoothed live eye-sphere center. Starts at frame center and gets
+        # EMA-updated every time we get a fresh estimate.
+        self.model_center_smooth = None  # np.array([x, y], float32)
+        self.EMA_ALPHA = 0.15            # higher = snappier, lower = smoother
+        self.MIN_RAYS = 6                # need at least this many ellipses
+        self.MIN_ANGLE_DEG = 3.0         # reject near-parallel ray pairs
+
         self._kernel = np.ones((5, 5), np.uint8)
+
+    # ---- vectorized eye-center estimation from recent ellipses ----
+    def estimate_eye_center(self, frame_shape):
+        """Estimate the 2D eye-sphere center from the rolling buffer of
+        ellipse centers + minor-axis directions. Vectorized: no Python pair
+        loops. Returns (x, y) or None."""
+        mask = self.ellipses[:, 3] > 0.5
+        data = self.ellipses[mask]
+        if len(data) < self.MIN_RAYS:
+            return None
+
+        cx = data[:, 0]
+        cy = data[:, 1]
+        ang = np.deg2rad(data[:, 2])
+        # Perpendicular to the ellipse major axis direction (same as original).
+        dx = -np.sin(ang)
+        dy = np.cos(ang)
+
+        n = len(data)
+        # Build all unique pairs (i < j) with triu_indices.
+        i_idx, j_idx = np.triu_indices(n, k=1)
+
+        x1, y1 = cx[i_idx], cy[i_idx]
+        x2, y2 = cx[j_idx], cy[j_idx]
+        d1x, d1y = dx[i_idx], dy[i_idx]
+        d2x, d2y = dx[j_idx], dy[j_idx]
+
+        # Reject near-parallel ray pairs.
+        cos_theta = d1x * d2x + d1y * d2y
+        keep_ang = np.abs(cos_theta) < np.cos(np.deg2rad(self.MIN_ANGLE_DEG))
+        if not np.any(keep_ang):
+            return None
+
+        # Solve each 2x2 system [[d1x, -d2x],[d1y, -d2y]] * [t1, t2]^T = [dx, dy]
+        det = d1x * (-d2y) - (-d2x) * d1y  # = -d1x*d2y + d2x*d1y
+        rhs_x = x2 - x1
+        rhs_y = y2 - y1
+
+        valid = keep_ang & (np.abs(det) > 1e-6)
+        if not np.any(valid):
+            return None
+
+        t1 = np.empty_like(det)
+        t1[:] = np.nan
+        # t1 = ( (-d2y)*rhs_x - (-d2x)*rhs_y ) / det  = (-d2y*rhs_x + d2x*rhs_y)/det
+        t1[valid] = ((-d2y[valid]) * rhs_x[valid]
+                     - (-d2x[valid]) * rhs_y[valid]) / det[valid]
+
+        ix = x1 + t1 * d1x
+        iy = y1 + t1 * d1y
+
+        ix = ix[valid]
+        iy = iy[valid]
+
+        # Clip to frame bounds to kill wild outliers from parallel-ish rays.
+        h, w = frame_shape[:2]
+        in_bounds = (ix > -w) & (ix < 2 * w) & (iy > -h) & (iy < 2 * h)
+        ix = ix[in_bounds]
+        iy = iy[in_bounds]
+        if len(ix) < 3:
+            return None
+
+        # Robust center: median is far more stable than mean for this.
+        return float(np.median(ix)), float(np.median(iy))
 
     # ---- core processing (runs on worker thread) ----
     def process_frame(self, frame):
@@ -254,23 +331,45 @@ class EyeTracker:
                 final_ellipse = cv2.fitEllipse(refined)
                 (cx, cy), _, angle = final_ellipse
                 center_x, center_y = int(cx), int(cy)
-                self.ellipses[self.counter % 60] = [cx, cy, angle]
+                # Store with valid=1 in the rolling buffer.
+                self.ellipses[self.counter % self.HISTORY] = [cx, cy, angle, 1.0]
                 self.counter += 1
 
         h, w = frame.shape[:2]
-        # Lock eye sphere center to frame center (same as original logic).
-        model_center = (w // 2, h // 2)
-        self.prev_model_center_avg = model_center
+
+        # Live eye-sphere center: estimate from the rolling ellipse buffer,
+        # then smooth with an EMA so it updates frame-to-frame without jitter.
+        estimate = self.estimate_eye_center((h, w))
+        if estimate is not None:
+            est_arr = np.array(estimate, dtype=np.float32)
+            if self.model_center_smooth is None:
+                self.model_center_smooth = est_arr
+            else:
+                self.model_center_smooth = (
+                    (1.0 - self.EMA_ALPHA) * self.model_center_smooth
+                    + self.EMA_ALPHA * est_arr
+                )
+        elif self.model_center_smooth is None:
+            # Until we have enough samples, fall back to frame center.
+            self.model_center_smooth = np.array([w / 2.0, h / 2.0],
+                                                dtype=np.float32)
+
+        mcx = int(np.clip(self.model_center_smooth[0], 0, w - 1))
+        mcy = int(np.clip(self.model_center_smooth[1], 0, h - 1))
+        model_center = (mcx, mcy)
 
         # Draw overlay.
-        cv2.circle(frame, model_center, 202, (255, 50, 50), 2)
+        locked = estimate is not None
+        sphere_color = (255, 50, 50) if locked else (120, 120, 120)
+        cv2.circle(frame, model_center, 202, sphere_color, 2)
         cv2.circle(frame, model_center, 8, (255, 255, 0), -1)
         if final_ellipse is not None and center_x is not None:
             cv2.line(frame, model_center, (center_x, center_y),
                      (255, 150, 50), 2)
             cv2.ellipse(frame, final_ellipse, (20, 255, 255), 2)
-        cv2.putText(frame, self.name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 255, 0), 2)
+        status = "LIVE" if locked else f"warmup {int(self.ellipses[:,3].sum())}/{self.MIN_RAYS}"
+        cv2.putText(frame, f"{self.name}  [{status}]", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         if center_x is None:
             return frame, None, None
