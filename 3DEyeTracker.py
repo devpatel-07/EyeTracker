@@ -1,50 +1,55 @@
 """
-Optimized dual eye tracker.
+Dual eye tracker with the OLD (single-eye) eye-center algorithm restored,
+but all of the new file's infrastructure kept intact:
 
-Key performance improvements vs. the original:
-  1. Threaded frame grabbers per camera/stream with a 1-slot queue so we always
-     process the LATEST frame and drop stale ones (kills MJPEG buffer lag).
-  2. Left and right eyes processed in parallel on a ThreadPoolExecutor.
-  3. `get_darkest_area` replaced with a single cv2.boxFilter + minMaxLoc call
-     (was a Python double loop -- typically 50-100x faster).
-  4. `optimize_contours_by_angle` fully vectorized with NumPy.
-  5. Single grayscale + single darkest-point lookup shared across the 3
-     threshold passes (was recomputed each time).
-  6. Ellipse ray history kept small and intersections computed with vectorized
-     NumPy instead of nested Python loops.
-  7. Matplotlib replaced with an OpenCV window for the 3D-ish gaze view --
-     matplotlib's interactive redraw was costing 100-300ms per frame.
-  8. cv2.setUseOptimized(True) and thread count hints.
+  * FreshestFrameGrabber threaded capture (always-latest-frame)
+  * Parallel per-eye processing on a ThreadPoolExecutor
+  * Fast image ops (boxFilter darkest-area, vectorized contour angle filter,
+    shared grayscale + shared darkest point across threshold passes)
+  * OpenCV-based 3D-ish gaze viz (no matplotlib)
+  * cv2.setUseOptimized, thread hints, FPS overlay, etc.
+
+The eye-center estimation itself is a faithful port of the original
+single-eye code:
+
+  * rays built from ellipse angle as (cos, sin) scaled by minor_axis/2
+    (i.e. along the major axis), NOT perpendicular to it
+  * per frame, pick N=5 random ellipses from a rolling list (cap 100),
+    intersect only CONSECUTIVE pairs (4 pairs)
+  * reject a pair if |angle1 - angle2| < 2 degrees
+  * only keep intersections that lie strictly inside the frame
+  * append to a per-eye stored_intersections buffer capped at M=1500,
+    take the MEAN of that whole buffer as the raw center
+  * additionally smooth via mean-of-last-200 (update_and_average_point)
+  * fallback to (320, 240) -> prev_model_center_avg stickiness exactly
+    like the original
 """
 
 import cv2
 import numpy as np
 import threading
-import queue
+import queue  # noqa: F401  (kept for parity with original new file)
 import time
+import random
 import tkinter as tk
 from tkinter import ttk, filedialog
 from concurrent.futures import ThreadPoolExecutor
 
 cv2.setUseOptimized(True)
 try:
-    cv2.setNumThreads(2)  # leave cores for our own threads
+    cv2.setNumThreads(2)
 except Exception:
     pass
 
 
 # ---------------------------------------------------------------------------
-# Threaded video capture -- always serves the freshest frame, drops backlog.
+# Threaded video capture -- unchanged from the new file.
 # ---------------------------------------------------------------------------
 class FreshestFrameGrabber:
-    """Background thread that continuously reads from a VideoCapture and keeps
-    only the most recent frame. Prevents MJPEG/network buffer buildup."""
-
     def __init__(self, source, name="cam"):
         self.source = source
         self.name = name
         self.cap = cv2.VideoCapture(source)
-        # Small internal buffer so we don't accumulate latency.
         try:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -63,7 +68,6 @@ class FreshestFrameGrabber:
         while self._running:
             ok, frame = self.cap.read()
             if not ok:
-                # Stream hiccup -- small sleep, try again. Don't spam.
                 time.sleep(0.005)
                 continue
             with self._lock:
@@ -73,8 +77,6 @@ class FreshestFrameGrabber:
         with self._lock:
             if self._latest is None:
                 return False, None
-            # Return a shallow copy so the consumer can mutate freely while
-            # the grabber overwrites _latest.
             return True, self._latest
 
     def release(self):
@@ -84,16 +86,12 @@ class FreshestFrameGrabber:
 
 
 # ---------------------------------------------------------------------------
-# Fast image ops
+# Fast image ops -- unchanged from the new file (these are non-algorithmic
+# speedups that don't touch the eye-center math).
 # ---------------------------------------------------------------------------
 def get_darkest_area_fast(gray):
-    """Find a small dark region using a box filter. One call instead of a
-    Python double loop. Returns (x, y) of the darkest 20x20 window center."""
-    # Blur the image with a 20x20 averaging filter; darkest pixel of the blur
-    # is the center of the darkest window.
     blurred = cv2.boxFilter(gray, ddepth=-1, ksize=(20, 20),
                             normalize=True, borderType=cv2.BORDER_REPLICATE)
-    # Ignore a border so we don't pick up frame edges.
     b = 20
     h, w = blurred.shape
     roi = blurred[b:h - b, b:w - b]
@@ -102,7 +100,6 @@ def get_darkest_area_fast(gray):
 
 
 def mask_outside_square(image, center, size):
-    """Zero everything outside a square centered at `center`."""
     x, y = center
     half = size // 2
     h, w = image.shape[:2]
@@ -114,8 +111,6 @@ def mask_outside_square(image, center, size):
 
 
 def optimize_contours_by_angle_fast(contour):
-    """Vectorized version of the original angle-filter. `contour` is an
-    (N, 1, 2) or (N, 2) array of points from cv2.findContours."""
     pts = contour.reshape(-1, 2).astype(np.float32)
     n = len(pts)
     if n < 10:
@@ -132,7 +127,6 @@ def optimize_contours_by_angle_fast(contour):
     vec_to_centroid = centroid - pts
     mid = (vec1 + vec2) * 0.5
 
-    # Keep points whose (vec1+vec2)/2 points roughly toward the centroid.
     cos_thresh = np.cos(np.radians(60))
     keep = (vec_to_centroid * mid).sum(axis=1) >= cos_thresh
 
@@ -143,7 +137,6 @@ def optimize_contours_by_angle_fast(contour):
 
 
 def filter_largest_valid_contour(contours, pixel_thresh=1000, ratio_thresh=3.0):
-    """Largest-area contour that isn't super elongated."""
     best = None
     best_area = 0
     for c in contours:
@@ -162,7 +155,6 @@ def filter_largest_valid_contour(contours, pixel_thresh=1000, ratio_thresh=3.0):
 
 
 def check_ellipse_goodness(binary_image, contour):
-    """Score: fraction of white pixels inside the fitted ellipse."""
     if len(contour) < 5:
         return 0.0
     ellipse = cv2.fitEllipse(contour)
@@ -176,7 +168,6 @@ def check_ellipse_goodness(binary_image, contour):
 
 
 def check_contour_pixels(contour, image_shape):
-    """How much of the contour actually lies under the fitted ellipse edge."""
     if len(contour) < 5:
         return (0, 0.0)
     contour_mask = np.zeros(image_shape, dtype=np.uint8)
@@ -199,108 +190,139 @@ def check_contour_pixels(contour, image_shape):
 
 
 # ---------------------------------------------------------------------------
-# Eye tracker
+# Eye tracker -- eye-center math reverted to the ORIGINAL algorithm.
 # ---------------------------------------------------------------------------
 class EyeTracker:
     def __init__(self, name, camera_position_3d):
         self.name = name
         self.camera_position = np.array(camera_position_3d, dtype=np.float32)
 
-        # Rolling buffer of recent ellipses used to triangulate eye center.
-        # Columns: cx, cy, angle_deg, valid_flag.
-        self.HISTORY = 40
-        self.ellipses = np.zeros((self.HISTORY, 4), dtype=np.float32)
-        self.counter = 0
+        # --- Original-algorithm state (formerly module-level globals) ---
+        # Rolling list of ellipse tuples ((cx,cy),(maj,min),angle) from
+        # recent successful fits. Same role as the old `ray_lines`.
+        self.ray_lines = []
+        self.max_rays = 100
 
-        # Last drawn rays (for visualization).
-        self.rays = []
+        # Persistent buffer of past intersection points (the old
+        # `stored_intersections`), capped at M=1500.
+        self.stored_intersections = []
+        self.max_stored_intersections = 1500
 
-        # Smoothed live eye-sphere center. Starts at frame center and gets
-        # EMA-updated every time we get a fresh estimate.
-        self.model_center_smooth = None  # np.array([x, y], float32)
-        self.EMA_ALPHA = 0.15            # higher = snappier, lower = smoother
-        self.MIN_RAYS = 6                # need at least this many ellipses
-        self.MIN_ANGLE_DEG = 3.0         # reject near-parallel ray pairs
+        # Rolling list of per-frame averaged centers, used for the
+        # last-N smoothing pass (the old `model_centers`, cap 200).
+        self.model_centers = []
+        self.model_centers_window = 200
+
+        # Hardcoded fallback + "stickiness" of previous output, exactly
+        # like the old code. 320x240 happens to match a 640x480 frame
+        # center; we keep the magic number for fidelity.
+        self.prev_model_center_avg = (320, 240)
+
+        # Algorithm hyperparameters matching the original
+        # compute_average_intersection call: N=5, M=1500, spacing=5.
+        self.N_RANDOM_LINES = 5
+        self.MIN_ANGLE_DIFF_DEG = 2.0
 
         self._kernel = np.ones((5, 5), np.uint8)
 
-    # ---- vectorized eye-center estimation from recent ellipses ----
-    def estimate_eye_center(self, frame_shape):
-        """Estimate the 2D eye-sphere center from the rolling buffer of
-        ellipse centers + minor-axis directions. Vectorized: no Python pair
-        loops. Returns (x, y) or None."""
-        mask = self.ellipses[:, 3] > 0.5
-        data = self.ellipses[mask]
-        if len(data) < self.MIN_RAYS:
+    # -----------------------------------------------------------------
+    # Old-algorithm helpers, ported verbatim but as instance methods.
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _find_line_intersection(ellipse1, ellipse2):
+        """Intersection of two lines built from ellipses, OLD convention:
+        direction = (minor/2)*(cos(angle), sin(angle))  -- along major axis."""
+        (cx1, cy1), (_, minor_axis1), angle1 = ellipse1
+        (cx2, cy2), (_, minor_axis2), angle2 = ellipse2
+
+        a1 = np.deg2rad(angle1)
+        a2 = np.deg2rad(angle2)
+
+        dx1 = (minor_axis1 / 2.0) * np.cos(a1)
+        dy1 = (minor_axis1 / 2.0) * np.sin(a1)
+        dx2 = (minor_axis2 / 2.0) * np.cos(a2)
+        dy2 = (minor_axis2 / 2.0) * np.sin(a2)
+
+        A = np.array([[dx1, -dx2], [dy1, -dy2]])
+        B = np.array([cx2 - cx1, cy2 - cy1])
+
+        if np.linalg.det(A) == 0:
             return None
 
-        cx = data[:, 0]
-        cy = data[:, 1]
-        ang = np.deg2rad(data[:, 2])
-        # Perpendicular to the ellipse major axis direction (same as original).
-        dx = -np.sin(ang)
-        dy = np.cos(ang)
+        t1, _ = np.linalg.solve(A, B)
+        ix = cx1 + t1 * dx1
+        iy = cy1 + t1 * dy1
+        return (int(ix), int(iy))
 
-        n = len(data)
-        # Build all unique pairs (i < j) with triu_indices.
-        i_idx, j_idx = np.triu_indices(n, k=1)
+    def _compute_average_intersection(self, frame_shape, N):
+        """Port of the old compute_average_intersection.
 
-        x1, y1 = cx[i_idx], cy[i_idx]
-        x2, y2 = cx[j_idx], cy[j_idx]
-        d1x, d1y = dx[i_idx], dy[i_idx]
-        d2x, d2y = dx[j_idx], dy[j_idx]
+        * picks N random ellipses from self.ray_lines
+        * intersects only consecutive pairs in that random sample
+        * skips pairs whose angle differs by < 2 degrees
+        * only keeps intersections inside the frame
+        * appends to self.stored_intersections (cap 1500)
+        * returns MEAN of ALL stored intersections as (int, int), or None
+        """
+        if len(self.ray_lines) < 2 or N < 2:
+            return (0, 0)
 
-        # Reject near-parallel ray pairs.
-        cos_theta = d1x * d2x + d1y * d2y
-        keep_ang = np.abs(cos_theta) < np.cos(np.deg2rad(self.MIN_ANGLE_DEG))
-        if not np.any(keep_ang):
-            return None
-
-        # Solve each 2x2 system [[d1x, -d2x],[d1y, -d2y]] * [t1, t2]^T = [dx, dy]
-        det = d1x * (-d2y) - (-d2x) * d1y  # = -d1x*d2y + d2x*d1y
-        rhs_x = x2 - x1
-        rhs_y = y2 - y1
-
-        valid = keep_ang & (np.abs(det) > 1e-6)
-        if not np.any(valid):
-            return None
-
-        t1 = np.empty_like(det)
-        t1[:] = np.nan
-        # t1 = ( (-d2y)*rhs_x - (-d2x)*rhs_y ) / det  = (-d2y*rhs_x + d2x*rhs_y)/det
-        t1[valid] = ((-d2y[valid]) * rhs_x[valid]
-                     - (-d2x[valid]) * rhs_y[valid]) / det[valid]
-
-        ix = x1 + t1 * d1x
-        iy = y1 + t1 * d1y
-
-        ix = ix[valid]
-        iy = iy[valid]
-
-        # Clip to frame bounds to kill wild outliers from parallel-ish rays.
         h, w = frame_shape[:2]
-        in_bounds = (ix > -w) & (ix < 2 * w) & (iy > -h) & (iy < 2 * h)
-        ix = ix[in_bounds]
-        iy = iy[in_bounds]
-        if len(ix) < 3:
+
+        selected = random.sample(self.ray_lines,
+                                 min(N, len(self.ray_lines)))
+
+        new_intersections = []
+        for i in range(len(selected) - 1):
+            line1 = selected[i]
+            line2 = selected[i + 1]
+            angle1 = line1[2]
+            angle2 = line2[2]
+            if abs(angle1 - angle2) >= self.MIN_ANGLE_DIFF_DEG:
+                pt = self._find_line_intersection(line1, line2)
+                if pt is not None and 0 <= pt[0] < w and 0 <= pt[1] < h:
+                    new_intersections.append(pt)
+                    self.stored_intersections.append(pt)
+
+        # Prune to last M.
+        if len(self.stored_intersections) > self.max_stored_intersections:
+            self.stored_intersections = \
+                self.stored_intersections[-self.max_stored_intersections:]
+
+        if not new_intersections:
             return None
 
-        # Robust center: median is far more stable than mean for this.
-        return float(np.median(ix)), float(np.median(iy))
+        # MEAN over the entire stored buffer (this is what the old code did --
+        # note it uses stored_intersections, not just this frame's adds).
+        avg_x = np.mean([p[0] for p in self.stored_intersections])
+        avg_y = np.mean([p[1] for p in self.stored_intersections])
+        return (int(avg_x), int(avg_y))
 
-    # ---- core processing (runs on worker thread) ----
+    def _update_and_average_point(self, new_point):
+        """Port of the old update_and_average_point with window=200."""
+        self.model_centers.append(new_point)
+        if len(self.model_centers) > self.model_centers_window:
+            self.model_centers.pop(0)
+
+        if not self.model_centers:
+            return None
+
+        avg_x = int(np.mean([p[0] for p in self.model_centers]))
+        avg_y = int(np.mean([p[1] for p in self.model_centers]))
+        return (avg_x, avg_y)
+
+    # -----------------------------------------------------------------
+    # Core per-frame processing.
+    # -----------------------------------------------------------------
     def process_frame(self, frame):
-        # Pre-rotation done by caller.
         frame = cv2.flip(frame, 0)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         darkest_point = get_darkest_area_fast(gray)
         darkest_val = int(gray[darkest_point[1], darkest_point[0]])
 
-        # Build three thresholded images once each.
         best_contour = None
         best_score = 0.0
-        best_binary = None
 
         for added in (5, 15, 25):
             t = darkest_val + added
@@ -320,7 +342,6 @@ class EyeTracker:
             if score > best_score:
                 best_score = score
                 best_contour = cand
-                best_binary = dilated
 
         center_x = center_y = None
         final_ellipse = None
@@ -329,45 +350,45 @@ class EyeTracker:
             refined = optimize_contours_by_angle_fast(best_contour)
             if refined is not None and len(refined) >= 5:
                 final_ellipse = cv2.fitEllipse(refined)
-                (cx, cy), _, angle = final_ellipse
+                (cx, cy), _, _ = final_ellipse
                 center_x, center_y = int(cx), int(cy)
-                # Store with valid=1 in the rolling buffer.
-                self.ellipses[self.counter % self.HISTORY] = [cx, cy, angle, 1.0]
-                self.counter += 1
+
+                # Append the full ellipse tuple to ray_lines (OLD style --
+                # we store ((cx,cy),(maj,min),angle), not just the angle).
+                self.ray_lines.append(final_ellipse)
+                if len(self.ray_lines) > self.max_rays:
+                    self.ray_lines = self.ray_lines[-self.max_rays:]
 
         h, w = frame.shape[:2]
 
-        # Live eye-sphere center: estimate from the rolling ellipse buffer,
-        # then smooth with an EMA so it updates frame-to-frame without jitter.
-        estimate = self.estimate_eye_center((h, w))
-        if estimate is not None:
-            est_arr = np.array(estimate, dtype=np.float32)
-            if self.model_center_smooth is None:
-                self.model_center_smooth = est_arr
-            else:
-                self.model_center_smooth = (
-                    (1.0 - self.EMA_ALPHA) * self.model_center_smooth
-                    + self.EMA_ALPHA * est_arr
-                )
-        elif self.model_center_smooth is None:
-            # Until we have enough samples, fall back to frame center.
-            self.model_center_smooth = np.array([w / 2.0, h / 2.0],
-                                                dtype=np.float32)
+        # --- OLD eye-center algorithm ---
+        model_center_average = (320, 240)
+        raw = self._compute_average_intersection((h, w), self.N_RANDOM_LINES)
+        if raw is not None:
+            smoothed = self._update_and_average_point(raw)
+            if smoothed is not None:
+                model_center_average = smoothed
 
-        mcx = int(np.clip(self.model_center_smooth[0], 0, w - 1))
-        mcy = int(np.clip(self.model_center_smooth[1], 0, h - 1))
-        model_center = (mcx, mcy)
+        # Preserve the old stickiness: if we fell through to (320,240),
+        # use previous; else update previous.
+        if model_center_average[0] == 320:
+            model_center_average = self.prev_model_center_avg
+        if model_center_average[0] != 0:
+            self.prev_model_center_avg = model_center_average
 
         # Draw overlay.
-        locked = estimate is not None
+        # Locked == we have at least one real intersection stored.
+        locked = len(self.stored_intersections) > 0
         sphere_color = (255, 50, 50) if locked else (120, 120, 120)
-        cv2.circle(frame, model_center, 202, sphere_color, 2)
-        cv2.circle(frame, model_center, 8, (255, 255, 0), -1)
+        cv2.circle(frame, model_center_average, 202, sphere_color, 2)
+        cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)
         if final_ellipse is not None and center_x is not None:
-            cv2.line(frame, model_center, (center_x, center_y),
+            cv2.line(frame, model_center_average, (center_x, center_y),
                      (255, 150, 50), 2)
             cv2.ellipse(frame, final_ellipse, (20, 255, 255), 2)
-        status = "LIVE" if locked else f"warmup {int(self.ellipses[:,3].sum())}/{self.MIN_RAYS}"
+
+        status = ("LIVE" if locked
+                  else f"warmup {len(self.ray_lines)}/{self.N_RANDOM_LINES}")
         cv2.putText(frame, f"{self.name}  [{status}]", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
@@ -375,10 +396,14 @@ class EyeTracker:
             return frame, None, None
 
         sphere_center, gaze_dir = self.compute_gaze_vector(
-            center_x, center_y, model_center[0], model_center[1], w, h)
+            center_x, center_y,
+            model_center_average[0], model_center_average[1],
+            w, h)
         return frame, sphere_center, gaze_dir
 
-    # ---- gaze math (unchanged in spirit, tightened up) ----
+    # -----------------------------------------------------------------
+    # Gaze math (unchanged from the new file).
+    # -----------------------------------------------------------------
     def compute_gaze_vector(self, x, y, center_x, center_y,
                             screen_width=640, screen_height=480):
         fov_y_rad = np.radians(45.0)
@@ -459,7 +484,7 @@ class EyeTracker:
 
 
 # ---------------------------------------------------------------------------
-# Gaze intersection
+# Gaze intersection -- unchanged.
 # ---------------------------------------------------------------------------
 def compute_gaze_intersection(lc, ld, rc, rd):
     delta = lc - rc
@@ -479,7 +504,7 @@ def compute_gaze_intersection(lc, ld, rc, rd):
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main loop -- unchanged from the new file.
 # ---------------------------------------------------------------------------
 def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
     grab_l = FreshestFrameGrabber(src_left, "left")
@@ -490,10 +515,8 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
     pool = ThreadPoolExecutor(max_workers=2)
 
-    # Small OpenCV window for the 3D-ish view instead of matplotlib.
     viz = np.zeros((400, 400, 3), dtype=np.uint8)
 
-    # FPS tracking.
     fps_t0 = time.time()
     fps_frames = 0
     fps = 0.0
@@ -516,13 +539,11 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
                     continue
                 frame_r_rot = cv2.rotate(frame_r, cv2.ROTATE_90_CLOCKWISE)
 
-            # Run both eyes in parallel.
             fut_l = pool.submit(tracker_left.process_frame, frame_l_rot)
             fut_r = pool.submit(tracker_right.process_frame, frame_r_rot)
             out_l, lCenter, lDir = fut_l.result()
             out_r, rCenter, rDir = fut_r.result()
 
-            # Overlay FPS on left feed.
             fps_frames += 1
             if fps_frames >= 10:
                 now = time.time()
@@ -535,7 +556,6 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
             cv2.imshow("Left Eye Feed", out_l)
             cv2.imshow("Right Eye Feed", out_r)
 
-            # Lightweight 3D-ish viz (top-down XZ + side YZ).
             if lCenter is not None and rCenter is not None:
                 inter = compute_gaze_intersection(lCenter, lDir, rCenter, rDir)
                 viz[:] = 0
@@ -543,7 +563,6 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
                 def to_screen(p, ox, oy, scale=60):
                     return (int(ox + p[0] * scale), int(oy - p[2] * scale))
 
-                # Top-down panel (X vs Z) on left half.
                 cv2.putText(viz, "Top (X,Z)", (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                 lp = to_screen(lCenter, 100, 200)
@@ -555,7 +574,6 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
                 cv2.circle(viz, rp, 4, (255, 0, 0), -1)
                 cv2.circle(viz, ip, 5, (0, 255, 0), -1)
 
-                # Side panel (Y vs Z) on right half.
                 cv2.putText(viz, "Side (Y,Z)", (210, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
@@ -591,7 +609,7 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
 
 # ---------------------------------------------------------------------------
-# Camera detection + GUI
+# Camera detection + GUI -- unchanged.
 # ---------------------------------------------------------------------------
 def detect_cameras(max_cams=10):
     avail = []
