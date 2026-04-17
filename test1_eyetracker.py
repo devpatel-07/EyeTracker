@@ -10,9 +10,9 @@ Key performance improvements vs. the original:
   4. `optimize_contours_by_angle` fully vectorized with NumPy.
   5. Single grayscale + single darkest-point lookup shared across the 3
      threshold passes (was recomputed each time).
-  6. Eye-center estimation now uses the user's per-frame ray-intersection
-     routine across all valid candidate ellipses, with a small ray history
-     purely for visualization.
+  6. Eye-center estimation uses pairwise ray intersections across all valid
+     candidate ellipses per frame, with a ROLLING-WINDOW average of the most
+     recent intersection points (see EYE_CENTER_WINDOW below).
   7. Matplotlib replaced with an OpenCV window for the 3D-ish gaze view --
      matplotlib's interactive redraw was costing 100-300ms per frame.
   8. cv2.setUseOptimized(True) and thread count hints.
@@ -21,9 +21,9 @@ Key performance improvements vs. the original:
 import cv2
 import numpy as np
 import threading
-import queue
 import time
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, filedialog
 from concurrent.futures import ThreadPoolExecutor
 
@@ -65,15 +65,25 @@ EYE_RADIUS_PX = 202
 LEFT_YAW_SIGN, LEFT_PITCH_SIGN = +1.0, -1.0
 RIGHT_YAW_SIGN, RIGHT_PITCH_SIGN = -1.0, -1.0
 
-# Calibration: how many frames with valid samples before the eye
-# center gets locked in. Raise for more stable lock, lower for faster
-# startup during dev.
-CALIB_FRAMES = 100
+# Eye-center estimator: rolling window.
+#   EYE_CENTER_WINDOW -- max number of recent pairwise intersection points
+#   kept in the ring buffer. Eye center = mean of everything currently in
+#   the buffer. As new points arrive, the oldest get evicted, so the
+#   estimate stays fresh and self-heals from stale/bad samples without
+#   ever storing all history.
+#   BASELINE_FRAMES   -- how many frames with valid samples before the UI
+#   marks the estimate as "baseline reached" (color flips to green). The
+#   estimate is usable before that; this just gates the status indicator.
+EYE_CENTER_WINDOW = 500
+BASELINE_FRAMES   = 100
 
 # Top-down viz scale (pixels per meter). 100 px/m -> 1 px = 1 cm,
 # with a 4 m x 4 m field of view on a 400 px window.
 VIZ_SIZE = 400
 VIZ_SCALE = 100.0
+
+# Gaze-target print throttling. Set to None to disable the live print.
+GAZE_PRINT_HZ = 5.0
 # ===========================================================================
 
 
@@ -246,7 +256,9 @@ def check_contour_pixels(contour, image_shape):
 # Eye tracker
 # ---------------------------------------------------------------------------
 class EyeTracker:
-    def __init__(self, name, eye_position_room, yaw_sign, pitch_sign):
+    def __init__(self, name, eye_position_room, yaw_sign, pitch_sign,
+                 window_size=EYE_CENTER_WINDOW,
+                 baseline_frames=BASELINE_FRAMES):
         """
         Parameters
         ----------
@@ -259,6 +271,13 @@ class EyeTracker:
         yaw_sign, pitch_sign : +1 or -1
             Per-eye sign flips to reconcile image-pixel pupil motion
             with world yaw/pitch. See the config block for tuning.
+        window_size : int
+            Max number of recent pairwise intersection points kept in the
+            rolling average. Older points are evicted automatically.
+        baseline_frames : int
+            Number of sample-contributing frames required before the UI
+            reports "baseline reached". The estimate is usable before
+            that; this just gates the status indicator.
         """
         self.name = name
         self.eye_position_room = np.array(eye_position_room, dtype=np.float64)
@@ -267,27 +286,18 @@ class EyeTracker:
         self.pitch_sign = float(pitch_sign)
 
         # Per-instance ray history for visualization only. List of
-        # ((cx, cy), (est_x, est_y)) tuples, capped at 10 entries.
+        # ((cx, cy), (est_x, est_y)) tuples, capped at RAY_HISTORY entries.
         self.rays = []
         self.RAY_HISTORY = 10
 
-        # Persistent accumulator: running mean of every pairwise ray
-        # intersection we've ever computed. The eye sphere is fixed
-        # relative to the camera (headset-mounted), so more samples = a
-        # more accurate fixed estimate. We store only sum + count, not the
-        # full list, so memory stays O(1).
-        self._intersection_sum = np.zeros(2, dtype=np.float64)
-        self._intersection_count = 0
-
-        # Calibration: after CALIB_FRAMES frames have contributed samples,
-        # we snapshot the running mean and freeze it -- that snapshot is
-        # what downstream gaze math uses from then on. New intersections
-        # keep accumulating in the background (so the raw running mean
-        # keeps refining), but the locked value does NOT change. Press
-        # 'r' to wipe everything and re-calibrate.
-        self.CALIB_FRAMES = CALIB_FRAMES
+        # ---- Rolling-window eye-center estimator ----
+        # Ring buffer of the most recent (x, y) pairwise-intersection points
+        # in image space. As new points are appended, the oldest drop off.
+        # The eye center is always the mean of whatever is currently in the
+        # buffer -- no locking, no separate "running mean" accumulator.
+        self._intersections = deque(maxlen=window_size)
         self._frames_with_samples = 0
-        self._locked_center = None  # (x, y) ints once calibrated
+        self._baseline_frames = baseline_frames
 
         self._kernel = np.ones((5, 5), np.uint8)
 
@@ -297,107 +307,96 @@ class EyeTracker:
         self.eye_position_room = np.array(xyz_meters, dtype=np.float64)
 
     def reset_eye_center(self):
-        """Clear accumulator AND the lock. Call this if the headset shifts
-        and the anatomical center needs to be re-measured."""
-        self._intersection_sum[:] = 0.0
-        self._intersection_count = 0
+        """Clear the rolling window. Call this if the headset shifts and
+        the anatomical center needs to be re-measured from scratch."""
+        self._intersections.clear()
         self._frames_with_samples = 0
-        self._locked_center = None
         self.rays.clear()
 
     @property
-    def running_mean(self):
-        """Live running-mean estimate across all samples so far.
-        None if we have zero samples."""
-        if self._intersection_count == 0:
-            return None
-        mean = self._intersection_sum / self._intersection_count
-        return (int(mean[0]), int(mean[1]))
+    def sample_count(self):
+        """Number of intersection points currently in the rolling window."""
+        return len(self._intersections)
+
+    @property
+    def is_baseline_reached(self):
+        """True once enough frames have contributed samples for the
+        rolling-window mean to be considered trustworthy for display."""
+        return self._frames_with_samples >= self._baseline_frames
 
     @property
     def eye_center(self):
-        """The eye-center value used by downstream gaze math. Before
-        calibration completes this is the live running mean; after
-        calibration it's the frozen snapshot."""
-        if self._locked_center is not None:
-            return self._locked_center
-        return self.running_mean
+        """Rolling-window mean of all intersection points currently in the
+        buffer. None if we have zero samples yet."""
+        if not self._intersections:
+            return None
+        # deque of 2-tuples -> (N, 2) array -> column-wise mean.
+        arr = np.asarray(self._intersections, dtype=np.float64)
+        mean = arr.mean(axis=0)
+        return (int(mean[0]), int(mean[1]))
 
     # ---- per-frame eye-center estimation from candidate ellipses ----
     def eyecenter_estimation(self, ellipses, frame):
-        """Intersect the minor-axis rays of all ellipses in the current
-        frame, feed intersections into the running-mean accumulator, and
-        once we've collected CALIB_FRAMES worth of data, lock in the mean
-        as the definitive eye center. After locking, new intersections
-        still get accumulated (so the raw mean keeps refining) but the
-        returned value stays frozen.
+        """Compute pairwise ray intersections across all candidate ellipses
+        in the current frame, push them into the rolling window, and return
+        the current rolling-mean eye center.
+
+        Uses the explicit calculation: for each pair of rays (minor axis of
+        each ellipse), solve the 2x2 linear system for the intersection
+        parameter, skipping near-parallel and numerically-singular pairs.
 
         `ellipses` is a list of (cx, cy, angle_deg) tuples. `frame` is
         drawn on for visualization. Returns (x, y) int tuple or None.
         """
-        # Build rays for the ellipses in this frame.
+        # Build rays for all ellipses
         current_rays = []
         for (cx, cy, angle_deg) in ellipses:
             a = np.deg2rad(angle_deg)
             dx, dy = -np.sin(a), np.cos(a)
             current_rays.append((cx, cy, dx, dy))
 
-        # Accumulate intersections from ALL pairs in this frame.
-        samples_this_frame = 0
-        if len(current_rays) >= 2:
-            for i in range(len(current_rays)):
-                for j in range(i + 1, len(current_rays)):
-                    x1, y1, ddx1, ddy1 = current_rays[i]
-                    x2, y2, ddx2, ddy2 = current_rays[j]
+        # Compute intersections across ALL pairs in current frame
+        intersections = []
+        for i in range(len(current_rays)):
+            for j in range(i + 1, len(current_rays)):
+                x1, y1, ddx1, ddy1 = current_rays[i]
+                x2, y2, ddx2, ddy2 = current_rays[j]
 
-                    v1 = np.array([ddx1, ddy1])
-                    v2 = np.array([ddx2, ddy2])
-                    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
-                    if denom < 1e-8:
-                        continue
-                    cos_theta = np.dot(v1, v2) / denom
+                v1 = np.array([ddx1, ddy1])
+                v2 = np.array([ddx2, ddy2])
+                denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+                if denom < 1e-8:
+                    continue
+                cos_theta = np.dot(v1, v2) / denom
 
-                    # Reject near-parallel rays (< 2 deg apart).
-                    if abs(cos_theta) > np.cos(np.deg2rad(2)):
-                        continue
+                # Reject near-parallel rays (< 2 deg apart).
+                if abs(cos_theta) > np.cos(np.deg2rad(2)):
+                    continue
 
-                    A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
-                    B = np.array([x2 - x1, y2 - y1])
+                A = np.array([[ddx1, -ddx2], [ddy1, -ddy2]])
+                B = np.array([x2 - x1, y2 - y1])
 
-                    try:
-                        t1, _ = np.linalg.solve(A, B)
-                    except np.linalg.LinAlgError:
-                        continue
+                try:
+                    t1, _ = np.linalg.solve(A, B)
+                except np.linalg.LinAlgError:
+                    continue
 
-                    ix = x1 + t1 * ddx1
-                    iy = y1 + t1 * ddy1
+                intersectionX = x1 + t1 * ddx1
+                intersectionY = y1 + t1 * ddy1
+                intersections.append((intersectionX, intersectionY))
 
-                    # Reject wild outliers far outside the frame -- they'd
-                    # poison the running mean.
-                    h, w = frame.shape[:2]
-                    if not (-w < ix < 2 * w and -h < iy < 2 * h):
-                        continue
-
-                    self._intersection_sum[0] += ix
-                    self._intersection_sum[1] += iy
-                    self._intersection_count += 1
-                    samples_this_frame += 1
-
-        # A "calibration frame" is any frame that contributed >=1 sample.
-        if samples_this_frame > 0 and self._locked_center is None:
+        # Push into the rolling window. The deque's maxlen handles eviction.
+        if intersections:
             self._frames_with_samples += 1
-            if self._frames_with_samples >= self.CALIB_FRAMES:
-                # Lock in the running mean as the definitive eye center.
-                self._locked_center = self.running_mean
+            for pt in intersections:
+                self._intersections.append(pt)
 
-        # Value returned to downstream code: locked snapshot if calibrated,
-        # otherwise the live running mean.
         est_center = self.eye_center
         if est_center is None:
             return None
 
         # Draw faint magenta ray trail from this frame's ellipse centers
-        # toward the eye center.
+        # toward the eye center. (Visualization only.)
         for (cx, cy, _, __) in current_rays:
             line = ((int(cx), int(cy)), est_center)
             if line not in self.rays:
@@ -470,9 +469,7 @@ class EyeTracker:
 
         h, w = frame.shape[:2]
 
-        # Eye-sphere center: a fixed anatomical point. We accumulate every
-        # pairwise ray intersection across all frames and use the running
-        # mean directly -- no further smoothing needed.
+        # Eye-sphere center from the rolling-window estimator.
         estimate = self.eyecenter_estimation(candidate_ellipses, frame)
         if estimate is not None:
             mcx = int(np.clip(estimate[0], 0, w - 1))
@@ -484,24 +481,26 @@ class EyeTracker:
         model_center = (mcx, mcy)
 
         # Draw overlay.
-        locked = estimate is not None
-        is_calibrated = self._locked_center is not None
-        if is_calibrated:
-            sphere_color = (50, 200, 50)    # green: locked
-        elif locked:
-            sphere_color = (255, 50, 50)    # blue: calibrating
+        have_estimate = estimate is not None
+        baseline = self.is_baseline_reached
+        if baseline:
+            sphere_color = (50, 200, 50)    # green: baseline reached
+        elif have_estimate:
+            sphere_color = (255, 50, 50)    # blue: collecting samples
         else:
-            sphere_color = (120, 120, 120)  # gray: no data
+            sphere_color = (120, 120, 120)  # gray: no data yet
         cv2.circle(frame, model_center, 202, sphere_color, 2)
         cv2.circle(frame, model_center, 8, (255, 255, 0), -1)
         if final_ellipse is not None and center_x is not None:
             cv2.line(frame, model_center, (center_x, center_y),
                      (255, 150, 50), 2)
             cv2.ellipse(frame, final_ellipse, (20, 255, 255), 2)
-        if is_calibrated:
-            status = f"LOCKED  (n={self._intersection_count})"
-        elif locked:
-            status = f"calib {self._frames_with_samples}/{self.CALIB_FRAMES}"
+        if baseline:
+            status = (f"BASELINE  window={self.sample_count}"
+                      f"/{self._intersections.maxlen}")
+        elif have_estimate:
+            status = (f"collecting {self._frames_with_samples}"
+                      f"/{self._baseline_frames}")
         else:
             status = "searching"
         cv2.putText(frame, f"{self.name}  [{status}]", (10, 30),
@@ -516,8 +515,8 @@ class EyeTracker:
 
     # ---- gaze ray in room coordinates ----
     def compute_gaze_ray(self, pupil_x, pupil_y, center_x, center_y):
-        """Convert the 2D pupil offset from the locked eye center into a
-        3D gaze ray in ROOM coordinates.
+        """Convert the 2D pupil offset from the rolling-window eye center
+        into a 3D gaze ray in ROOM coordinates.
 
         Returns (origin, direction) where both are float64 numpy arrays
         in meters. `origin` is `self.eye_position_room`. `direction` is
@@ -548,20 +547,11 @@ class EyeTracker:
         sx = np.clip(dx / r, -1.0, 1.0)
         sy = np.clip(dy / r, -1.0, 1.0)
 
-        # Image-axis convention after the upstream flip/rotate: +image_x
-        # is user's horizontal, +image_y is vertical-down. So pupil
-        # moving right in image -> +yaw; pupil moving down in image ->
-        # +pitch DOWN, i.e. -pitch. We express that with the pitch_sign
-        # knob so the user can flip either axis empirically.
         yaw = self.yaw_sign * np.arcsin(sx)      # rotate about +Z (up)
         pitch = self.pitch_sign * np.arcsin(sy)  # rotate about +X (right)
 
         # Start with a "straight ahead" ray: +Y forward.
         # Apply pitch (about +X) then yaw (about +Z).
-        # Straight-ahead vector after pitch: (0, cos(pitch), sin(pitch))
-        # After yaw about Z: x' = -sin(yaw)*y_mid,
-        #                    y' =  cos(yaw)*y_mid,
-        #                    z' =  z_mid
         cp, sp = np.cos(pitch), np.sin(pitch)
         cy_, sy_ = np.cos(yaw), np.sin(yaw)
         y_mid = cp
@@ -577,26 +567,34 @@ class EyeTracker:
         return self.eye_position_room.copy(), direction
 
 
-# ---------------------------------------------------------------------------
-# Gaze intersection in room coordinates
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# GAZE POINT (ARM TARGET)
+# ===========================================================================
+# `intersect_gaze_rays` is the function that produces the 3D gaze point --
+# the intersection of the two eye vectors. This is what you hand off to
+# the arm. The main loop calls it every frame and stores the result in
+# the `gaze_target` variable; see `send_to_arm` below for the handoff
+# point.
+# ===========================================================================
 def intersect_gaze_rays(lc, ld, rc, rd):
     """Least-squares closest-point of two 3D rays (one per eye) in room
-    coordinates.
+    coordinates. This is the gaze intersection point -- the 3D location in
+    the room the user is looking at.
 
     lc, rc : np.ndarray shape (3,)  -- ray origins (left-eye and right-eye
              positions in meters)
     ld, rd : np.ndarray shape (3,)  -- unit gaze directions
 
-    Returns the midpoint of the shortest segment connecting the two rays.
-    This is the 3D "gaze target" -- the point in the room the user is
-    looking at, ready to hand off to a robot arm. Returns None if the
-    rays are nearly parallel (convergence point is at infinity, not
-    useful).
-
-    Also returns the distance between the closest points on each ray as
-    a confidence signal -- if this is large, the two eyes aren't
-    actually converging on a single point and the "target" is unreliable.
+    Returns
+    -------
+    midpoint : np.ndarray shape (3,) or None
+        The 3D "gaze target" -- meters, room coordinates, ready for the
+        arm. None if the rays are nearly parallel (target would be at
+        infinity).
+    miss_distance : float or None
+        Distance between the closest points on each ray (meters). Small
+        = the eyes are truly converging on a point and the target is
+        trustworthy. Large = they're not, be suspicious.
     """
     delta = lc - rc
     dll = float(np.dot(ld, ld))
@@ -614,6 +612,28 @@ def intersect_gaze_rays(lc, ld, rc, rd):
     midpoint = (p_l + p_r) * 0.5
     miss_distance = float(np.linalg.norm(p_l - p_r))
     return midpoint, miss_distance
+
+
+def send_to_arm(gaze_target, miss_distance, left_ray, right_ray):
+    """Hook point for arm control. Called every frame a valid gaze target
+    exists. Replace the body with your actual arm command (ROS publish,
+    socket send, serial write, whatever).
+
+    Parameters
+    ----------
+    gaze_target : np.ndarray shape (3,)
+        Target point in ROOM coordinates (meters). +X right, +Y forward,
+        +Z up. Same frame the arm should be driven in.
+    miss_distance : float
+        Convergence confidence. < ~0.05 m is tight; > 0.10 m means the
+        two eyes aren't really pointing at the same thing and the arm
+        probably shouldn't move.
+    left_ray, right_ray : (origin, direction) tuples of np.ndarray
+        The individual eye rays, if your arm needs them (e.g. for
+        dominant-eye override or line-of-sight extension).
+    """
+    # --- plug in your arm driver here ---
+    return
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +667,10 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
     fps_t0 = time.time()
     fps_frames = 0
     fps = 0.0
+
+    # Gaze-target print throttle.
+    last_print_t = 0.0
+    print_interval = (1.0 / GAZE_PRINT_HZ) if GAZE_PRINT_HZ else None
 
     # Midpoint between eyes, used as the viz origin.
     mid_eye = 0.5 * (np.array(LEFT_EYE_POSITION)
@@ -701,7 +725,7 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
             # ---- Room-coordinate top-down gaze visualization ----
             viz[:] = 0
-            # Grid: 10 cm minor, 1 m major.
+            # Grid: 1 m major.
             for m in range(-2, 3):
                 u0 = int(VIZ_SIZE * 0.5 + m * VIZ_SCALE)
                 v0 = int(VIZ_SIZE * 0.5 - m * VIZ_SCALE)
@@ -719,6 +743,10 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
             cv2.circle(viz, lp, 4, (0, 0, 255), -1)
             cv2.circle(viz, rp, 4, (255, 0, 0), -1)
 
+            # =============================================================
+            # GAZE POINT COMPUTATION -- the 3D intersection of the two eye
+            # vectors. `gaze_target` is what the arm consumes.
+            # =============================================================
             gaze_target = None
             miss = None
             if l_origin is not None and r_origin is not None:
@@ -736,12 +764,9 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
                 if gaze_target is not None:
                     tp = room_to_viz_topdown(gaze_target)
-                    # Clip to image bounds before drawing.
                     if 0 <= tp[0] < VIZ_SIZE and 0 <= tp[1] < VIZ_SIZE:
                         cv2.circle(viz, tp, 6, (0, 255, 0), -1)
                         cv2.circle(viz, tp, 10, (0, 255, 0), 1)
-                    # Print target in meters plus the convergence miss
-                    # distance (large miss = unreliable).
                     cv2.putText(
                         viz,
                         f"target: ({gaze_target[0]:+.2f}, "
@@ -754,15 +779,24 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 255, 0) if miss < 0.05 else (0, 165, 255), 1)
 
-            cv2.imshow("Top-down Room (m)", viz)
+                    # ---- Arm handoff ----
+                    send_to_arm(gaze_target, miss,
+                                (l_origin, l_dir), (r_origin, r_dir))
 
-            # --- data the arm would consume, printed once per second ---
-            if gaze_target is not None and int(time.time() * 2) % 2 == 0:
-                # This is what you'd actually send to the arm:
-                #   point:      gaze_target (meters, room coords)
-                #   left_ray:   (l_origin, l_dir)
-                #   right_ray:  (r_origin, r_dir)
-                pass
+                    # Throttled debug print of the arm input.
+                    if print_interval is not None:
+                        now = time.time()
+                        if now - last_print_t >= print_interval:
+                            print(
+                                f"[gaze] target=("
+                                f"{gaze_target[0]:+.3f},"
+                                f"{gaze_target[1]:+.3f},"
+                                f"{gaze_target[2]:+.3f}) m  "
+                                f"miss={miss * 100:.1f} cm"
+                            )
+                            last_print_t = now
+
+            cv2.imshow("Top-down Room (m)", viz)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -770,7 +804,7 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
             elif key == ord(' '):
                 cv2.waitKey(0)
             elif key == ord('r'):
-                # Headset shifted? Wipe the accumulators and re-measure.
+                # Headset shifted? Wipe the rolling windows and re-measure.
                 tracker_left.reset_eye_center()
                 tracker_right.reset_eye_center()
     finally:
