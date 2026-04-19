@@ -15,6 +15,13 @@ except ImportError:
     GL_SPHERE_AVAILABLE = False
     print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
+try:
+    import gaze_viz_3d
+    VIZ_3D_AVAILABLE = True
+except ImportError:
+    VIZ_3D_AVAILABLE = False
+    print("gaze_viz_3d module not found. 3D gaze visualization will be disabled.")
+
 ray_lines = [] 
 model_centers = []
 max_rays = 100
@@ -266,6 +273,10 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     global prev_model_center_avg
     global max_observed_distance
 
+    direction = None
+    center_x = None
+    center_y = None
+
     kernel_size = 5
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
 
@@ -357,7 +368,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     
     # Example safety check
     if center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
-        return  # or skip this frame
+        return final_rotated_rect, None
 
     # Calculate the distance only if model_centers has at least 100 values
     if len(model_centers) >= 100 and center_x is not None:
@@ -435,7 +446,7 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             blended = cv2.addWeighted(frame, 0.6, gl_image, 0.4, 0)
             cv2.imshow("Eye Tracker + Sphere", blended)
 
-    return final_rotated_rect
+    return final_rotated_rect, direction
 
 def update_and_average_point(point_list, new_point, N):
     """
@@ -791,7 +802,7 @@ def process_frame(frame):
     thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
     
     #take the three images thresholded at different levels and process them
-    final_rotated_rect = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, False, False)
+    final_rotated_rect, _ = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, False, False)
     
     return final_rotated_rect
 
@@ -993,24 +1004,40 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
         print(f"Error: Could not open right source: {src_right}")
         return
 
-    # Name the windows up front so they stay separate
-    cv2.namedWindow("Left Eye - Gaze", cv2.WINDOW_NORMAL)
+    # Reset per-eye state each run so stale data doesn't carry over
+    for state in (_eye_state_left, _eye_state_right):
+        state['ray_lines'] = []
+        state['model_centers'] = []
+        state['stored_intersections'] = []
+        state['max_observed_distance'] = 0
+        state['prev_model_center_avg'] = (320, 240)
+
+    cv2.namedWindow("Left Eye - Gaze",  cv2.WINDOW_NORMAL)
     cv2.namedWindow("Right Eye - Gaze", cv2.WINDOW_NORMAL)
 
     if GL_SPHERE_AVAILABLE:
         gl_sphere.start_gl_window()
+
+    if VIZ_3D_AVAILABLE:
+        gaze_viz_3d.start()
+
+    # Throttle matplotlib updates so the 3D viz doesn't steal time from cv2
+    viz_update_interval = 3
+    frame_idx = 0
 
     while True:
         ret_l, frame_l = cap_l.read()
         ret_r, frame_r = cap_r.read()
 
         if mirror_mode and ret_l:
-            # Mirror the single source for the right eye
             frame_r = cv2.flip(frame_l, 1)
             ret_r = True
 
         if not ret_l and not ret_r:
-            break  # Both sources exhausted
+            break
+
+        l_direction = None
+        r_direction = None
 
         # --- Left eye ---
         if ret_l:
@@ -1025,10 +1052,11 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
                 saved_l = _swap_eye_state(_eye_state_left)
                 try:
-                    process_frames(th_s_l, th_m_l, th_r_l, frame_l_disp, gray_l, darkest_pt_l, False, False)
+                    _, l_direction = process_frames(
+                        th_s_l, th_m_l, th_r_l, frame_l_disp, gray_l, darkest_pt_l, False, False)
                 finally:
                     _restore_eye_state(_eye_state_left, saved_l)
-                #rotate frame
+
                 frame_l_disp = cv2.rotate(frame_l_disp, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 cv2.imshow("Left Eye - Gaze", frame_l_disp)
 
@@ -1045,13 +1073,26 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
                 saved_r = _swap_eye_state(_eye_state_right)
                 try:
-                    process_frames(th_s_r, th_m_r, th_r_r, frame_r_disp, gray_r, darkest_pt_r, False, False)
+                    _, r_direction = process_frames(
+                        th_s_r, th_m_r, th_r_r, frame_r_disp, gray_r, darkest_pt_r, False, False)
                 finally:
                     _restore_eye_state(_eye_state_right, saved_r)
-                
-                #rotate frame
+
                 frame_r_disp = cv2.rotate(frame_r_disp, cv2.ROTATE_90_CLOCKWISE)
                 cv2.imshow("Right Eye - Gaze", frame_r_disp)
+
+        # --- 3D gaze visualization ---
+        if (VIZ_3D_AVAILABLE
+                and l_direction is not None
+                and r_direction is not None
+                and frame_idx % viz_update_interval == 0):
+            intersection = gaze_viz_3d.compute_gaze_intersection(
+                gaze_viz_3d.LEFT_EYE_POS,  l_direction,
+                gaze_viz_3d.RIGHT_EYE_POS, r_direction,
+            )
+            gaze_viz_3d.update(l_direction, r_direction, intersection)
+
+        frame_idx += 1
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -1062,6 +1103,8 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
     cap_l.release()
     cap_r.release()
     cv2.destroyAllWindows()
+    if VIZ_3D_AVAILABLE:
+        gaze_viz_3d.stop()
 
 
 # ---------------------------------------------------------------------------
