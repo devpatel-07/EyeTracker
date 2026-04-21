@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import sys
 import time
+import gaze_world
 
 try:
     import gl_sphere
@@ -1081,16 +1082,25 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
                 frame_r_disp = cv2.rotate(frame_r_disp, cv2.ROTATE_90_CLOCKWISE)
                 cv2.imshow("Right Eye - Gaze", frame_r_disp)
 
-        # --- 3D gaze visualization ---
-        if (VIZ_3D_AVAILABLE
-                and l_direction is not None
-                and r_direction is not None
-                and frame_idx % viz_update_interval == 0):
-            intersection = gaze_viz_3d.compute_gaze_intersection(
-                gaze_viz_3d.LEFT_EYE_POS,  l_direction,
-                gaze_viz_3d.RIGHT_EYE_POS, r_direction,
-            )
-            gaze_viz_3d.update(l_direction, r_direction, intersection)
+        # --- World-space gaze ---
+        if l_direction is not None and r_direction is not None:
+            result = gaze_world.compute_world_gaze_projected(l_direction, r_direction)
+            if result is not None:
+                tx, ty, tz = result['target_world']
+                print(f"Gaze target (world): "
+                      f"X={tx:+.2f}  Y={ty:.2f}  Z={tz:+.2f} m  "
+                      f"| height={result['height']:.2f} m  "
+                      f"| dist={result['distance']:.2f} m  "
+                      f"| miss={result['miss_distance']*100:.1f} cm")
+
+                if VIZ_3D_AVAILABLE and frame_idx % viz_update_interval == 0:
+                    gaze_viz_3d.update(
+                        result['left_origin_world'],
+                        result['left_direction_world'],
+                        result['right_origin_world'],
+                        result['right_direction_world'],
+                        result['target_world'],
+                    )
 
         frame_idx += 1
 
@@ -1099,6 +1109,18 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
             break
         elif key == ord(' '):
             cv2.waitKey(0)
+
+    cap_l.release()
+    cap_r.release()
+    cv2.destroyAllWindows()
+    if VIZ_3D_AVAILABLE:
+        gaze_viz_3d.stop()
+
+        # key = cv2.waitKey(1) & 0xFF
+        # if key == ord('q'):
+        #     break
+        # elif key == ord(' '):
+        #     cv2.waitKey(0)
 
     cap_l.release()
     cap_r.release()
@@ -1129,8 +1151,8 @@ def dual_selection_gui():
                  values=[str(c) for c in cameras]).pack()
 
     def start_streams():
-        src_l = "http://10.159.67.46:8080?action=stream"
-        src_r = "http://10.159.67.46:8081?action=stream"
+        src_l = "http://10.159.65.65:8080?action=stream"
+        src_r = "http://10.159.65.65:8081?action=stream"
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
 
