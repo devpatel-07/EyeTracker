@@ -1,5 +1,7 @@
 import matplotlib
-matplotlib.use('TkAgg')
+# Qt5Agg: avoids "Cannot load backend 'TkAgg' ... as 'qt' is currently running"
+# when OpenCV/Qt loads first. Requires PyQt5 (see project requirements).
+matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 

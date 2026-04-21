@@ -383,16 +383,29 @@ def update_sphere_rotation(x, y, center_x, center_y, screen_width=640, screen_he
     # Normalize the result to get a direction vector
     gaze_rotated /= np.linalg.norm(gaze_rotated)
 
-    # Redraw the OpenGL scene
+    # Redraw the OpenGL scene; process Qt events so paintGL runs before readback.
     sphere_widget.update()
+    if app is not None:
+        app.processEvents()
 
-    # Flush OpenGL pipeline and read back pixels
-    glFinish()
+    # Read back default framebuffer (must use widget's GL context; macOS core profile rejects GL_FRONT).
     w = sphere_widget.width()
     h = sphere_widget.height()
-    glReadBuffer(GL_FRONT)
-    pixels = glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE)
-    image = np.frombuffer(pixels, dtype=np.uint8).reshape((h, w, 3))
-    image = np.flipud(image)
+    if w <= 0 or h <= 0:
+        return None
 
-    return image
+    sphere_widget.makeCurrent()
+    try:
+        glFinish()
+        glReadBuffer(GL_BACK)
+        pixels = glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE)
+        image = np.frombuffer(pixels, dtype=np.uint8).reshape((h, w, 3))
+        image = np.flipud(image)
+        return image
+    except Exception:
+        return None
+    finally:
+        try:
+            sphere_widget.doneCurrent()
+        except Exception:
+            pass
