@@ -15,24 +15,6 @@ CAMERA_EYE_DISTANCE = 0.03      # 3 cm lens-to-eye
 CAMERA_INWARD_ANGLE = np.radians(-35.0)  # camera rotated 35° to face eyeball
 
 # ---------------------------------------------------------------------------
-# Adjustable runtime parameters
-# ---------------------------------------------------------------------------
-GAZE_PLANE_DISTANCE = 1.0   # meters — how far in front of the subject the gaze plane sits
-                             # 0.5 = arm's length, 1.0 = conversation distance,
-                             # 2.0 = across-the-room, 3.0 = far wall
-
-GAZE_GAIN_X         = 2.5   # horizontal sensitivity multiplier (side-to-side)
-GAZE_GAIN_Y         = 1.0   # vertical sensitivity multiplier (up/down)
-
-GAZE_SMOOTHING      = 0.85  # 0 = no smoothing (jittery), 0.95 = very smooth but laggy
-
-GAZE_MAX_JUMP       = 0.3   # max allowed change in direction vector per frame
-                             # reject anything larger as a tracking glitch
-
-FLIP_LEFT_EYE_Y     = True   # set True if left eye camera Y is inverted
-FLIP_RIGHT_EYE_Y    = True   # set True if right eye camera Y is inverted
-
-# ---------------------------------------------------------------------------
 # Frames:
 #   HEAD frame  — origin between the eyes, +X right, +Y up, +Z forward
 #   WORLD frame — origin on the floor below the subject, +X right,
@@ -42,34 +24,149 @@ LEFT_EYE_HEAD  = np.array([-IPD / 2.0, 0.0, 0.0])
 RIGHT_EYE_HEAD = np.array([ IPD / 2.0, 0.0, 0.0])
 
 # Default head pose: standing upright, looking down +Z, at the origin.
+# Head origin sits at eye height above the floor.
 HEAD_POSITION_WORLD = np.array([0.0, EYE_HEIGHT, 0.0])
-HEAD_ROTATION_WORLD = np.eye(3)
+HEAD_ROTATION_WORLD = np.eye(3)   # identity — no head yaw/pitch/roll
+
+# ---------------------------------------------------------------------------
+# Adjustable runtime parameters
+# ---------------------------------------------------------------------------
+GAZE_PLANE_DISTANCE = 1.0   # meters — how far in front of the subject the gaze plane sits
+                            # 0.5 = arm's length, 1.0 = conversation distance,
+                            # 2.0 = across-the-room, 3.0 = far wall
+
+GAZE_GAIN_X         = 2.5   # horizontal sensitivity multiplier (side-to-side)
+GAZE_GAIN_Y         = 1.0   # vertical sensitivity multiplier (up/down)
+                            # The sphere model compresses angles — boost until
+                            # looking fully left/right moves the target off-screen.
+
+GAZE_SMOOTHING      = 0.85  # 0 = no smoothing (jittery), 0.95 = very smooth but laggy
+                            # 0.85 is a good starting point.
+
+FLIP_LEFT_EYE_Y     = False # set True if left eye camera is mounted upside-down
+FLIP_RIGHT_EYE_Y    = False # set True if right eye camera is mounted upside-down
+
+# Internal state for smoothing
+_smoothed_target_head = None
+
+
+def compute_world_gaze_projected(l_dir_cam, r_dir_cam):
+    """Direction-only gaze: average both eyes' directions, project onto a
+    plane at fixed distance in front of the subject. Ignores vergence.
+    
+    Applies X/Y gain to compensate for the sphere model's compressed angle
+    output, and exponential smoothing to reduce jitter.
+    """
+    global _smoothed_target_head
+    
+    if l_dir_cam is None or r_dir_cam is None:
+        return None
+
+    l_head = transform_gaze_to_head(l_dir_cam, 'left')
+    r_head = transform_gaze_to_head(r_dir_cam, 'right')
+    
+    # Optional per-eye Y flip (if a camera is mounted inverted)
+    if FLIP_LEFT_EYE_Y:
+        l_head = l_head * np.array([1.0, -1.0, 1.0])
+    if FLIP_RIGHT_EYE_Y:
+        r_head = r_head * np.array([1.0, -1.0, 1.0])
+
+    # Average the two directions
+    avg_dir_head = (l_head + r_head) / 2.0
+    n = np.linalg.norm(avg_dir_head)
+    if n < 1e-9:
+        return None
+    avg_dir_head /= n
+    
+    # Apply gain: amplify X and Y, keep Z, then re-normalize.
+    # This compensates for the sphere model producing compressed angles.
+    avg_dir_head = np.array([
+        avg_dir_head[0] * GAZE_GAIN_X,
+        avg_dir_head[1] * GAZE_GAIN_Y,
+        avg_dir_head[2],
+    ])
+    avg_dir_head /= np.linalg.norm(avg_dir_head)
+
+    # Origin: midpoint between eyes
+    eye_mid_head = (LEFT_EYE_HEAD + RIGHT_EYE_HEAD) / 2.0
+
+    # Project onto a plane at Z = GAZE_PLANE_DISTANCE in head frame
+    if abs(avg_dir_head[2]) < 1e-6:
+        target_head = eye_mid_head + avg_dir_head * GAZE_PLANE_DISTANCE
+    else:
+        t = (GAZE_PLANE_DISTANCE - eye_mid_head[2]) / avg_dir_head[2]
+        target_head = eye_mid_head + t * avg_dir_head
+
+    # Exponential smoothing: blend with previous target
+    if _smoothed_target_head is None:
+        _smoothed_target_head = target_head.copy()
+    else:
+        _smoothed_target_head = (
+            GAZE_SMOOTHING * _smoothed_target_head
+            + (1.0 - GAZE_SMOOTHING) * target_head
+        )
+    target_head = _smoothed_target_head.copy()
+
+    # Head → world
+    target_world     = head_to_world(target_head, is_direction=False)
+    l_origin_world   = head_to_world(LEFT_EYE_HEAD,  is_direction=False)
+    r_origin_world   = head_to_world(RIGHT_EYE_HEAD, is_direction=False)
+    l_dir_world      = head_to_world(l_head, is_direction=True)
+    r_dir_world      = head_to_world(r_head, is_direction=True)
+
+    return {
+        'left_origin_world':     l_origin_world,
+        'left_direction_world':  l_dir_world,
+        'right_origin_world':    r_origin_world,
+        'right_direction_world': r_dir_world,
+        'target_world':          target_world,
+        'target_head':           target_head,
+        'distance':              GAZE_PLANE_DISTANCE,
+        'miss_distance':         0.0,
+        'height':                target_world[1],
+        'gaze_direction_head':   avg_dir_head,
+    }
+
+
+def reset_smoothing():
+    """Call this when starting a new session to clear smoothed state."""
+    global _smoothed_target_head
+    _smoothed_target_head = None
 
 
 def _rot_x(a):
     c, s = np.cos(a), np.sin(a)
-    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    return np.array([[1,0,0],[0,c,-s],[0,s,c]])
 
 def _rot_y(a):
     c, s = np.cos(a), np.sin(a)
-    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    return np.array([[c,0,s],[0,1,0],[-s,0,c]])
 
 def _rot_z(a):
     c, s = np.cos(a), np.sin(a)
-    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    return np.array([[c,-s,0],[s,c,0],[0,0,1]])
 
 
 def set_head_pose(position=None, yaw=0.0, pitch=0.0, roll=0.0):
-    """Update the head's pose in world frame."""
+    """Update the head's pose in world frame.
+    
+    Args:
+        position: 3-vector (x, y, z) of head origin (eye midpoint) in world.
+                  If None, uses default (0, EYE_HEIGHT, 0).
+        yaw:   rotation about world +Y in radians (turning left/right)
+        pitch: rotation about world +X in radians (nodding up/down)
+        roll:  rotation about world +Z in radians (tilting side to side)
+    """
     global HEAD_POSITION_WORLD, HEAD_ROTATION_WORLD
     if position is None:
         position = np.array([0.0, EYE_HEIGHT, 0.0])
     HEAD_POSITION_WORLD = np.asarray(position, dtype=float)
+    # Apply yaw, then pitch, then roll (intrinsic Y-X-Z)
     HEAD_ROTATION_WORLD = _rot_y(yaw) @ _rot_x(pitch) @ _rot_z(roll)
 
 
 # ---------------------------------------------------------------------------
-# Camera-to-head rotation matrices
+# Camera-to-head rotation matrices (unchanged from before)
 # ---------------------------------------------------------------------------
 _FLIP_Z = np.diag([1.0, 1.0, -1.0])
 R_LEFT_CAM_TO_HEAD  = _rot_y(-CAMERA_INWARD_ANGLE) @ _FLIP_Z
@@ -122,24 +219,39 @@ def closest_point_between_rays(p_a, d_a, p_b, d_b):
 
 
 # ---------------------------------------------------------------------------
-# Vergence-based API (kept for reference / future use)
+# Top-level API
 # ---------------------------------------------------------------------------
 def compute_world_gaze(l_dir_cam, r_dir_cam):
-    """Full pipeline: camera-frame gazes -> world-frame target via vergence."""
+    """Full pipeline: camera-frame gazes → world-frame target point.
+
+    Returns dict with:
+        left_origin_world,  left_direction_world   — left ray in world frame
+        right_origin_world, right_direction_world  — right ray in world frame
+        target_world       — 3D gaze target (meters, floor-origin world frame)
+        target_head        — same target expressed in head frame
+        distance           — distance from eye midpoint to target
+        miss_distance      — how close the two rays came (stereo confidence)
+        height             — Y coordinate of target (useful: floor=0, eye=EYE_HEIGHT)
+    """
     if l_dir_cam is None or r_dir_cam is None:
         return None
 
+    # Camera → head
     l_dir_head = transform_gaze_to_head(l_dir_cam, 'left')
     r_dir_head = transform_gaze_to_head(r_dir_cam, 'right')
 
+    # Intersect in head frame first (cheaper, same result after rigid transform)
     target_head, miss = closest_point_between_rays(
-        LEFT_EYE_HEAD, l_dir_head, RIGHT_EYE_HEAD, r_dir_head)
+        LEFT_EYE_HEAD,  l_dir_head,
+        RIGHT_EYE_HEAD, r_dir_head,
+    )
 
-    target_world   = head_to_world(target_head, is_direction=False)
-    l_origin_world = head_to_world(LEFT_EYE_HEAD, is_direction=False)
-    r_origin_world = head_to_world(RIGHT_EYE_HEAD, is_direction=False)
-    l_dir_world    = head_to_world(l_dir_head, is_direction=True)
-    r_dir_world    = head_to_world(r_dir_head, is_direction=True)
+    # Head → world
+    target_world       = head_to_world(target_head, is_direction=False)
+    l_origin_world     = head_to_world(LEFT_EYE_HEAD,  is_direction=False)
+    r_origin_world     = head_to_world(RIGHT_EYE_HEAD, is_direction=False)
+    l_dir_world        = head_to_world(l_dir_head, is_direction=True)
+    r_dir_world        = head_to_world(r_dir_head, is_direction=True)
 
     eye_mid_world = (l_origin_world + r_origin_world) / 2.0
     distance = np.linalg.norm(target_world - eye_mid_world)
@@ -155,124 +267,3 @@ def compute_world_gaze(l_dir_cam, r_dir_cam):
         'miss_distance':         miss,
         'height':                target_world[1],
     }
-
-
-# ---------------------------------------------------------------------------
-# Internal state for smoothing / outlier rejection
-# ---------------------------------------------------------------------------
-_smoothed_target_head = None
-_prev_avg_dir = None
-
-
-def reset_smoothing():
-    """Call when starting a new session to clear smoothed state."""
-    global _smoothed_target_head, _prev_avg_dir
-    _smoothed_target_head = None
-    _prev_avg_dir = None
-
-
-# ---------------------------------------------------------------------------
-# Direction-only projected API (recommended)
-# ---------------------------------------------------------------------------
-def compute_world_gaze_projected(l_dir_cam, r_dir_cam):
-    """Direction-only gaze: average both eyes, project onto a plane at
-    GAZE_PLANE_DISTANCE meters in front of the subject.
-
-    Applies per-eye Y flip, X/Y gain, outlier rejection, and smoothing.
-    """
-    global _smoothed_target_head, _prev_avg_dir
-
-    if l_dir_cam is None or r_dir_cam is None:
-        return None
-
-    l_head = transform_gaze_to_head(l_dir_cam, 'left')
-    r_head = transform_gaze_to_head(r_dir_cam, 'right')
-
-    # Optional per-eye Y flip (if a camera is mounted inverted)
-    if FLIP_LEFT_EYE_Y:
-        l_head = l_head * np.array([1.0, -1.0, 1.0])
-    if FLIP_RIGHT_EYE_Y:
-        r_head = r_head * np.array([1.0, -1.0, 1.0])
-
-    # Average the two directions
-    avg_dir_head = (l_head + r_head) / 2.0
-    n = np.linalg.norm(avg_dir_head)
-    if n < 1e-9:
-        return None
-    avg_dir_head /= n
-
-    # Apply gain: amplify X and Y to compensate for compressed sphere-model angles
-    avg_dir_head = np.array([
-        avg_dir_head[0] * GAZE_GAIN_X,
-        avg_dir_head[1] * GAZE_GAIN_Y,
-        avg_dir_head[2],
-    ])
-    avg_dir_head /= np.linalg.norm(avg_dir_head)
-
-    # Outlier rejection: skip frames where direction jumped too much
-    if _prev_avg_dir is not None:
-        jump = np.linalg.norm(avg_dir_head - _prev_avg_dir)
-        if jump > GAZE_MAX_JUMP:
-            avg_dir_head = _prev_avg_dir.copy()
-    _prev_avg_dir = avg_dir_head.copy()
-
-    # Origin: midpoint between eyes
-    eye_mid_head = (LEFT_EYE_HEAD + RIGHT_EYE_HEAD) / 2.0
-
-    # Project onto a plane at Z = GAZE_PLANE_DISTANCE in head frame
-    if abs(avg_dir_head[2]) < 1e-6:
-        target_head = eye_mid_head + avg_dir_head * GAZE_PLANE_DISTANCE
-    else:
-        t = (GAZE_PLANE_DISTANCE - eye_mid_head[2]) / avg_dir_head[2]
-        target_head = eye_mid_head + t * avg_dir_head
-
-    # Exponential smoothing
-    if _smoothed_target_head is None:
-        _smoothed_target_head = target_head.copy()
-    else:
-        _smoothed_target_head = (
-            GAZE_SMOOTHING * _smoothed_target_head
-            + (1.0 - GAZE_SMOOTHING) * target_head
-        )
-    target_head = _smoothed_target_head.copy()
-
-    # Head -> world
-    target_world   = head_to_world(target_head, is_direction=False)
-    l_origin_world = head_to_world(LEFT_EYE_HEAD, is_direction=False)
-    r_origin_world = head_to_world(RIGHT_EYE_HEAD, is_direction=False)
-    l_dir_world    = head_to_world(l_head, is_direction=True)
-    r_dir_world    = head_to_world(r_head, is_direction=True)
-
-    return {
-        'left_origin_world':     l_origin_world,
-        'left_direction_world':  l_dir_world,
-        'right_origin_world':    r_origin_world,
-        'right_direction_world': r_dir_world,
-        'target_world':          target_world,
-        'target_head':           target_head,
-        'distance':              GAZE_PLANE_DISTANCE,
-        'miss_distance':         0.0,
-        'height':                target_world[1],
-        'gaze_direction_head':   avg_dir_head,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Debug helper
-# ---------------------------------------------------------------------------
-def debug_gaze(l_dir_cam, r_dir_cam):
-    """Print raw and transformed gaze vectors for sign-checking."""
-    l_head = transform_gaze_to_head(l_dir_cam, 'left')
-    r_head = transform_gaze_to_head(r_dir_cam, 'right')
-    if FLIP_LEFT_EYE_Y:
-        l_head = l_head * np.array([1.0, -1.0, 1.0])
-    if FLIP_RIGHT_EYE_Y:
-        r_head = r_head * np.array([1.0, -1.0, 1.0])
-    mean = (l_head + r_head) / 2.0
-    diff = l_head - r_head
-    print(f"  L cam:  ({l_dir_cam[0]:+.2f}, {l_dir_cam[1]:+.2f}, {l_dir_cam[2]:+.2f})")
-    print(f"  R cam:  ({r_dir_cam[0]:+.2f}, {r_dir_cam[1]:+.2f}, {r_dir_cam[2]:+.2f})")
-    print(f"  L head: ({l_head[0]:+.2f}, {l_head[1]:+.2f}, {l_head[2]:+.2f})")
-    print(f"  R head: ({r_head[0]:+.2f}, {r_head[1]:+.2f}, {r_head[2]:+.2f})")
-    print(f"  mean:   ({mean[0]:+.2f}, {mean[1]:+.2f}, {mean[2]:+.2f})")
-    print(f"  L-R X:  {diff[0]:+.3f}")
