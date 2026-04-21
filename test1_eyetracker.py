@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import sys
 import time
+import threading
 
 try:
     import gl_sphere
@@ -16,6 +17,9 @@ except ImportError:
     print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
 try:
+    import matplotlib
+    matplotlib.use('TkAgg')  # must be set before any pyplot import; TkAgg is
+                             # compatible with Tkinter which is already running
     import gaze_viz_3d
     VIZ_3D_AVAILABLE = True
 except ImportError:
@@ -27,6 +31,8 @@ model_centers = []
 max_rays = 100
 prev_model_center_avg = (320,240)
 max_observed_distance = 0  # Initialize adaptive radius
+cached_threshold_idx = None   # 0/1/2 once a good threshold level is found per eye
+_suppress_internal_windows = False  # set True in dual mode to hide internal imshows
 
 # Function to detect available cameras
 def detect_cameras(max_cams=10):
@@ -172,6 +178,7 @@ def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thr
                     largest_contour = contour
 
     return [largest_contour] if largest_contour is not None else []
+
 #Fits an ellipse to the optimized contours and draws it on the image.
 def fit_and_draw_ellipses(image, optimized_contours, color):
     if len(optimized_contours) >= 5:
@@ -267,11 +274,27 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     return ellipse_goodness
 
 # Process frames for pupil detection
-def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
-    global ray_lines
-    global max_rays
-    global prev_model_center_avg
-    global max_observed_distance
+def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window, state=None):
+    # ---------------------------------------------------------------------------
+    # Resolve state: use the passed-in per-eye dict when available (dual mode),
+    # otherwise fall back to the legacy module-level globals (single-eye mode).
+    # ---------------------------------------------------------------------------
+    if state is not None:
+        _ray_lines            = state['ray_lines']
+        _model_centers        = state['model_centers']
+        _stored_intersections = state['stored_intersections']
+        _max_observed_distance = state['max_observed_distance']
+        _prev_model_center_avg = state['prev_model_center_avg']
+        _cached_threshold_idx  = state['cached_threshold_idx']
+    else:
+        global ray_lines, model_centers, stored_intersections
+        global max_observed_distance, prev_model_center_avg, cached_threshold_idx
+        _ray_lines            = ray_lines
+        _model_centers        = model_centers
+        _stored_intersections = stored_intersections
+        _max_observed_distance = max_observed_distance
+        _prev_model_center_avg = prev_model_center_avg
+        _cached_threshold_idx  = cached_threshold_idx
 
     direction = None
     center_x = None
@@ -301,8 +324,19 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     gray_copies = [gray_copy1, gray_copy2, gray_copy3]
     final_goodness = 0
     
-    #iterate through binary images and see which fits the ellipse best
-    for i in range(1,4):
+    #iterate through binary images and see which fits the ellipse best.
+    # Caching: if a threshold level worked last frame, try it first and break
+    # immediately on success (1 iteration instead of 3). If it misses, fall
+    # through to the remaining indices so the cache can be re-established.
+    if _cached_threshold_idx is not None:
+        others = [j for j in range(1, 4) if j != _cached_threshold_idx + 1]
+        search_order = [_cached_threshold_idx + 1] + others
+    else:
+        search_order = list(range(1, 4))
+
+    best_thresh_i = None
+
+    for i in search_order:
         # Dilate the binary image
         dilated_image = cv2.dilate(image_array[i-1], kernel, iterations=2)#medium
         
@@ -337,6 +371,14 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
             best_image = image_array[i-1]
             final_contours = reduced_contours
             final_image = dilated_image
+            best_thresh_i = i
+            if _cached_threshold_idx is not None:
+                # Cached index worked — no need to evaluate the other two
+                break
+
+    # Persist the winning threshold level so next frame starts here directly
+    if best_thresh_i is not None:
+        _cached_threshold_idx = best_thresh_i - 1
 
     test_frame = frame.copy()
     
@@ -349,40 +391,53 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         final_rotated_rect = ellipse
 
         # Store the new ray in the list
-        ray_lines.append(final_rotated_rect)
+        _ray_lines.append(final_rotated_rect)
         # **Prune rays if list exceeds max_rays**
-        if len(ray_lines) > max_rays:
-            num_to_remove = len(ray_lines) - max_rays
-            ray_lines = ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
+        if len(_ray_lines) > max_rays:
+            num_to_remove = len(_ray_lines) - max_rays
+            _ray_lines = _ray_lines[num_to_remove:]  # Keep only the last `max_rays` elements
 
     model_center_average = (320,240)
 
-    model_center = compute_average_intersection(frame, ray_lines, 5, 1500, 5)
+    model_center = compute_average_intersection(frame, _ray_lines, _stored_intersections, 5, 1500, 5)
     if model_center is not None:
-        model_center_average = update_and_average_point(model_centers, model_center, 200)
+        model_center_average = update_and_average_point(_model_centers, model_center, 200)
 
     if model_center_average[0] == 320:
-        model_center_average = prev_model_center_avg
+        model_center_average = _prev_model_center_avg
     if model_center_average[0] != 0:
-        prev_model_center_avg = model_center_average
+        _prev_model_center_avg = model_center_average
     
     # Example safety check
     if center_x is None or center_y is None or model_center_average[0] is None or model_center_average[1] is None:
+        # Write state back before early return
+        if state is not None:
+            state['ray_lines']             = _ray_lines
+            state['model_centers']         = _model_centers
+            state['stored_intersections']  = _stored_intersections
+            state['max_observed_distance'] = _max_observed_distance
+            state['prev_model_center_avg'] = _prev_model_center_avg
+            state['cached_threshold_idx']  = _cached_threshold_idx
+        else:
+            ray_lines             = _ray_lines
+            model_centers         = _model_centers
+            stored_intersections  = _stored_intersections
+            max_observed_distance = _max_observed_distance
+            prev_model_center_avg = _prev_model_center_avg
+            cached_threshold_idx  = _cached_threshold_idx
         return final_rotated_rect, None
 
     # Calculate the distance only if model_centers has at least 100 values
-    if len(model_centers) >= 100 and center_x is not None:
+    if len(_model_centers) >= 100 and center_x is not None:
         distance = math.sqrt((center_x - model_center_average[0]) ** 2 + (center_y - model_center_average[1]) ** 2)
-        if distance > max_observed_distance:
-            max_observed_distance = distance
+        if distance > _max_observed_distance:
+            _max_observed_distance = distance
             
-    max_observed_distance = 202
+    _max_observed_distance = 202
 
     # Draw reference lines/ellipses
-    cv2.circle(frame, model_center_average, int(max_observed_distance), (255, 50, 50), 2)  # Draw eye sphere (circle)
+    cv2.circle(frame, model_center_average, int(_max_observed_distance), (255, 50, 50), 2)  # Draw eye sphere (circle)
     cv2.circle(frame, model_center_average, 8, (255, 255, 0), -1)  # Draw eye center
-
-
 
     if final_rotated_rect is not None and center_x is not None and center_y is not None:
         cv2.line(frame, model_center_average, (center_x, center_y), (255, 150, 50), 2)  # # Draw line from eye center to ellipse center
@@ -402,16 +457,11 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         # Draw the extended gaze line
         cv2.line(frame, (center_x, center_y), (extended_x, extended_y), (200, 255, 0), 3) 
 
-
-
-
     if render_cv_window:
         cv2.imshow("Best Thresholded Image Contours on Frame", frame)
 
-
     if GL_SPHERE_AVAILABLE:
         gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, model_center_average[0], model_center_average[1])
-    #cv2.circle(frame, (center_x, center_y), 22, (255, 255, 0), -1)  # Draw intersection center
 
     # Call the function
     center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
@@ -439,12 +489,31 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     else:
         print("No valid intersection found.")
 
-    cv2.imshow("Frame with Ellipse and Rays", frame)
+    if not _suppress_internal_windows:
+        cv2.imshow("Frame with Ellipse and Rays", frame)
 
     if GL_SPHERE_AVAILABLE:
         if gl_image is not None:
             blended = cv2.addWeighted(frame, 0.6, gl_image, 0.4, 0)
             cv2.imshow("Eye Tracker + Sphere", blended)
+
+    # ---------------------------------------------------------------------------
+    # Write local state variables back to wherever they came from
+    # ---------------------------------------------------------------------------
+    if state is not None:
+        state['ray_lines']             = _ray_lines
+        state['model_centers']         = _model_centers
+        state['stored_intersections']  = _stored_intersections
+        state['max_observed_distance'] = _max_observed_distance
+        state['prev_model_center_avg'] = _prev_model_center_avg
+        state['cached_threshold_idx']  = _cached_threshold_idx
+    else:
+        ray_lines             = _ray_lines
+        model_centers         = _model_centers
+        stored_intersections  = _stored_intersections
+        max_observed_distance = _max_observed_distance
+        prev_model_center_avg = _prev_model_center_avg
+        cached_threshold_idx  = _cached_threshold_idx
 
     return final_rotated_rect, direction
 
@@ -507,36 +576,31 @@ def draw_orthogonal_ray(image, ellipse, length=100, color=(0, 255, 0), thickness
 
 stored_intersections = []  # Stores all past intersections
 
-def compute_average_intersection(frame, ray_lines, N, M, spacing):
+def compute_average_intersection(frame, ray_lines_arg, stored_intersections_arg, N, M, spacing):
     """
     Selects N random lines from the list, highlights them in red on the frame,
     computes their intersections, stores them, and prunes stored intersections when exceeding M.
 
     Parameters:
     - frame: The OpenCV frame to draw on.
-    - ray_lines: List of ellipse tuples ((cx, cy), (major_axis, minor_axis), angle).
+    - ray_lines_arg: List of ellipse tuples ((cx, cy), (major_axis, minor_axis), angle).
+    - stored_intersections_arg: Per-eye list of stored intersections (passed in directly).
     - N: Number of random lines to select for intersection calculation.
     - M: Maximum number of stored intersections before pruning.
 
     Returns:
     - (avg_x, avg_y): Average intersection point of selected lines.
     """
-    global stored_intersections
-
-    if len(ray_lines) < 2 or N < 2:
+    if len(ray_lines_arg) < 2 or N < 2:
         return (0, 0)  # Need at least 2 lines to find intersections
 
     # Get frame dimensions dynamically
     height, width = frame.shape[:2]
 
     # Select N unique random lines
-    selected_lines = random.sample(ray_lines, min(N, len(ray_lines)))
+    selected_lines = random.sample(ray_lines_arg, min(N, len(ray_lines_arg)))
 
     intersections = []
-
-    # Highlight selected rays in red
-    #for ray in selected_lines:
-    #    draw_orthogonal_ray(frame, ray, color=(0, 0, 255), thickness=2)  # Red lines
 
     # Compute intersections for each pair of selected lines
     for i in range(len(selected_lines) - 1):
@@ -552,25 +616,18 @@ def compute_average_intersection(frame, ray_lines, N, M, spacing):
             # Ensure the intersection is within the frame bounds before adding
             if intersection and (0 <= intersection[0] < width) and (0 <= intersection[1] < height):
                 intersections.append(intersection)
-                stored_intersections.append(intersection)  # Store valid intersections
-        #else:
-        #    print(f"Skipped intersection: Angle difference too small ({abs(angle1 - angle2):.2f}°)")
+                stored_intersections_arg.append(intersection)  # Store valid intersections
 
     # Prune intersections if stored list exceeds M
-    if len(stored_intersections) > M:
-        stored_intersections = prune_intersections(stored_intersections, M)
-
-    # Draw all stored intersections on the frame
-    #for pt in stored_intersections:
-    #    cv2.circle(frame, pt, 3, (255, 255, 255), -1)  # White dot for every past intersection
+    if len(stored_intersections_arg) > M:
+        stored_intersections_arg[:] = prune_intersections(stored_intersections_arg, M)
 
     if not intersections:
         return None  # No valid intersections found
 
     # Compute the average intersection point
-    avg_x = np.mean([pt[0] for pt in stored_intersections])
-    avg_y = np.mean([pt[1] for pt in stored_intersections])
-
+    avg_x = np.mean([pt[0] for pt in stored_intersections_arg])
+    avg_y = np.mean([pt[1] for pt in stored_intersections_arg])
 
     return (int(avg_x), int(avg_y))
 
@@ -871,121 +928,97 @@ def selection_gui():
     global selected_camera
     cameras = detect_cameras()
 
-    # Create Tkinter window
     root = tk.Tk()
     root.title("Select Input Source")
     tk.Label(root, text="Orlosky Eye Tracker 3D", font=("Arial", 12, "bold")).pack(pady=10)
-
     tk.Label(root, text="Select Camera:").pack(pady=5)
 
     selected_camera = tk.StringVar()
     selected_camera.set(str(cameras[0]) if cameras else "No cameras found")
 
-    camera_dropdown = ttk.Combobox(root, textvariable=selected_camera, values=[str(cam) for cam in cameras])
+    camera_dropdown = ttk.Combobox(root, textvariable=selected_camera,
+                                   values=[str(cam) for cam in cameras])
     camera_dropdown.pack(pady=5)
 
-    tk.Button(root, text="Start Camera", command=lambda: [root.destroy(), process_camera()]).pack(pady=5)
-    tk.Button(root, text="Browse Video", command=lambda: [root.destroy(), process_video()]).pack(pady=5)
+    tk.Button(root, text="Start Camera",
+              command=lambda: [root.destroy(), process_camera()]).pack(pady=5)
+    tk.Button(root, text="Browse Video",
+              command=lambda: [root.destroy(), process_video()]).pack(pady=5)
 
     if GL_SPHERE_AVAILABLE:
-        # Start GL sphere window once
         app = gl_sphere.start_gl_window()
 
     root.mainloop()
 
 
 # ---------------------------------------------------------------------------
-# Dual-eye state management
+# Per-eye isolated state containers
 # ---------------------------------------------------------------------------
 
-# Per-eye state containers (left and right)
-_eye_state_left = {
-    'ray_lines': [],
-    'model_centers': [],
-    'stored_intersections': [],
-    'max_observed_distance': 0,
-    'prev_model_center_avg': (320, 240),
-}
-_eye_state_right = {
-    'ray_lines': [],
-    'model_centers': [],
-    'stored_intersections': [],
-    'max_observed_distance': 0,
-    'prev_model_center_avg': (320, 240),
-}
-
-
-def _swap_eye_state(state_dict):
-    """Swap the per-eye processing globals in/out so process_frames() can run
-    unchanged for each eye.  Returns a dict of the values that were displaced."""
-    global ray_lines, model_centers, stored_intersections, max_observed_distance, prev_model_center_avg
-    saved = {
-        'ray_lines': ray_lines,
-        'model_centers': model_centers,
-        'stored_intersections': stored_intersections,
-        'max_observed_distance': max_observed_distance,
-        'prev_model_center_avg': prev_model_center_avg,
+def _make_eye_state():
+    """Create a fresh per-eye state dict."""
+    return {
+        'ray_lines':             [],
+        'model_centers':         [],
+        'stored_intersections':  [],
+        'max_observed_distance': 0,
+        'prev_model_center_avg': (320, 240),
+        'cached_threshold_idx':  None,
     }
-    ray_lines = state_dict['ray_lines']
-    model_centers = state_dict['model_centers']
-    stored_intersections = state_dict['stored_intersections']
-    max_observed_distance = state_dict['max_observed_distance']
-    prev_model_center_avg = state_dict['prev_model_center_avg']
-    return saved
 
 
-def _restore_eye_state(state_dict, saved):
-    """Write current globals back into state_dict and restore from saved."""
-    global ray_lines, model_centers, stored_intersections, max_observed_distance, prev_model_center_avg
-    state_dict['ray_lines'] = ray_lines
-    state_dict['model_centers'] = model_centers
-    state_dict['stored_intersections'] = stored_intersections
-    state_dict['max_observed_distance'] = max_observed_distance
-    state_dict['prev_model_center_avg'] = prev_model_center_avg
-    ray_lines = saved['ray_lines']
-    model_centers = saved['model_centers']
-    stored_intersections = saved['stored_intersections']
-    max_observed_distance = saved['max_observed_distance']
-    prev_model_center_avg = saved['prev_model_center_avg']
+# ---------------------------------------------------------------------------
+# Threaded per-eye worker — no global lock, truly parallel
+# ---------------------------------------------------------------------------
 
+def _thread_process_eye(cap, eye_state, results, eye_key, mirror_frame=None):
+    """Read one frame from cap (or use mirror_frame), run the full detection
+    pipeline with the eye's own isolated state dict, and store results.
 
-def _process_frame_for_eye(frame, eye_state, window_label):
-    """Process one frame for a single eye using isolated per-eye global state.
-    Displays results in a window named window_label."""
-    saved = _swap_eye_state(eye_state)
-    try:
-        frame = crop_to_aspect_ratio(frame)
-        darkest_point = get_darkest_area(frame)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
+    Because process_frames() now reads/writes only the passed-in state dict
+    instead of module-level globals, both eye threads can run concurrently
+    with no locking whatsoever.
+    """
+    frame_key = eye_key + '_frame'
+    dir_key   = eye_key + '_dir'
+    ret_key   = eye_key + '_ret'
 
-        thresholded_image_strict  = apply_binary_threshold(gray_frame, darkest_pixel_value,  5)
-        thresholded_image_strict  = mask_outside_square(thresholded_image_strict,  darkest_point, 250)
-        thresholded_image_medium  = apply_binary_threshold(gray_frame, darkest_pixel_value, 15)
-        thresholded_image_medium  = mask_outside_square(thresholded_image_medium,  darkest_point, 250)
-        thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, 25)
-        thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
+    results[frame_key] = None
+    results[dir_key]   = None
+    results[ret_key]   = False
 
-        # process_frames() uses the globals that were just swapped in
-        process_frames(
-            thresholded_image_strict,
-            thresholded_image_medium,
-            thresholded_image_relaxed,
-            frame, gray_frame, darkest_point,
-            False, False,
-        )
+    # --- Frame capture ---
+    if mirror_frame is not None:
+        frame = cv2.flip(mirror_frame, 1)
+        ret   = True
+    else:
+        ret, frame = cap.read()
 
-        # Rename the OpenCV window so left and right appear separately
-        # (process_frames calls cv2.imshow with fixed names; we grab those
-        #  frames and re-display them under eye-specific names)
-        frame_win = "Frame with Ellipse and Rays"
-        if cv2.getWindowProperty(frame_win, cv2.WND_PROP_VISIBLE) >= 0:
-            img = None
-            # Re-show under the eye-specific label instead of overwriting
-            # We re-run imshow on the already-drawn frame (still in memory)
-            cv2.setWindowTitle(frame_win, window_label)
-    finally:
-        _restore_eye_state(eye_state, saved)
+    if not ret or frame is None:
+        return
+
+    results[ret_key] = True
+
+    # --- Pre-processing (identical to process_frame, but passes eye_state) ---
+    frame_disp = crop_to_aspect_ratio(frame.copy())
+    darkest_pt = get_darkest_area(frame_disp)
+    if darkest_pt is None:
+        return
+
+    gray = cv2.cvtColor(frame_disp, cv2.COLOR_BGR2GRAY)
+    dpv  = gray[darkest_pt[1], darkest_pt[0]]
+
+    th_s = mask_outside_square(apply_binary_threshold(gray, dpv,  5), darkest_pt, 250)
+    th_m = mask_outside_square(apply_binary_threshold(gray, dpv, 15), darkest_pt, 250)
+    th_r = mask_outside_square(apply_binary_threshold(gray, dpv, 25), darkest_pt, 250)
+
+    # --- Detection: isolated state, no globals touched ---
+    _, direction = process_frames(
+        th_s, th_m, th_r, frame_disp, gray, darkest_pt, False, False,
+        state=eye_state)
+
+    results[frame_key] = frame_disp
+    results[dir_key]   = direction
 
 
 # ---------------------------------------------------------------------------
@@ -993,7 +1026,7 @@ def _process_frame_for_eye(frame, eye_state, window_label):
 # ---------------------------------------------------------------------------
 
 def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
-    """Open two video sources and display gaze vectors on both simultaneously."""
+    """Open two video sources and process both eyes concurrently each frame."""
     cap_l = cv2.VideoCapture(src_left)
     cap_r = cv2.VideoCapture(src_right if (src_right and not mirror_mode) else src_left)
 
@@ -1004,93 +1037,74 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
         print(f"Error: Could not open right source: {src_right}")
         return
 
-    # Reset per-eye state each run so stale data doesn't carry over
-    for state in (_eye_state_left, _eye_state_right):
-        state['ray_lines'] = []
-        state['model_centers'] = []
-        state['stored_intersections'] = []
-        state['max_observed_distance'] = 0
-        state['prev_model_center_avg'] = (320, 240)
+    # Fresh isolated state for each eye
+    eye_state_left  = _make_eye_state()
+    eye_state_right = _make_eye_state()
+
+    global _suppress_internal_windows
+    _suppress_internal_windows = True
 
     cv2.namedWindow("Left Eye - Gaze",  cv2.WINDOW_NORMAL)
     cv2.namedWindow("Right Eye - Gaze", cv2.WINDOW_NORMAL)
 
-    if GL_SPHERE_AVAILABLE:
-        gl_sphere.start_gl_window()
-
     if VIZ_3D_AVAILABLE:
         gaze_viz_3d.start()
 
-    # Throttle matplotlib updates so the 3D viz doesn't steal time from cv2
     viz_update_interval = 3
     frame_idx = 0
 
     while True:
-        ret_l, frame_l = cap_l.read()
-        ret_r, frame_r = cap_r.read()
+        results = {}
 
-        if mirror_mode and ret_l:
-            frame_r = cv2.flip(frame_l, 1)
-            ret_r = True
+        if mirror_mode:
+            # Read the single source once and hand the same raw frame to both threads
+            ret_pre, frame_pre = cap_l.read()
+            mirror_src = frame_pre if ret_pre else None
+        else:
+            mirror_src = None
 
-        if not ret_l and not ret_r:
+        t_l = threading.Thread(
+            target=_thread_process_eye,
+            args=(cap_l, eye_state_left,  results, 'l'),
+            kwargs={'mirror_frame': mirror_src if mirror_mode else None},
+            daemon=True,
+        )
+        t_r = threading.Thread(
+            target=_thread_process_eye,
+            args=(cap_r, eye_state_right, results, 'r'),
+            kwargs={'mirror_frame': mirror_src if mirror_mode else None},
+            daemon=True,
+        )
+
+        t_l.start()
+        t_r.start()
+        t_l.join()
+        t_r.join()
+
+        if not results.get('l_ret') and not results.get('r_ret'):
             break
 
-        l_direction = None
-        r_direction = None
+        # Display (main thread only — required on most platforms)
+        frame_l = results.get('l_frame')
+        frame_r = results.get('r_frame')
 
-        # --- Left eye ---
-        if ret_l:
-            frame_l_disp = crop_to_aspect_ratio(frame_l.copy())
-            darkest_pt_l = get_darkest_area(frame_l_disp)
-            if darkest_pt_l is not None:
-                gray_l = cv2.cvtColor(frame_l_disp, cv2.COLOR_BGR2GRAY)
-                dpv_l  = gray_l[darkest_pt_l[1], darkest_pt_l[0]]
-                th_s_l = mask_outside_square(apply_binary_threshold(gray_l, dpv_l,  5), darkest_pt_l, 250)
-                th_m_l = mask_outside_square(apply_binary_threshold(gray_l, dpv_l, 15), darkest_pt_l, 250)
-                th_r_l = mask_outside_square(apply_binary_threshold(gray_l, dpv_l, 25), darkest_pt_l, 250)
+        if frame_l is not None:
+            cv2.imshow("Left Eye - Gaze",  frame_l)
+        if frame_r is not None:
+            cv2.imshow("Right Eye - Gaze", frame_r)
 
-                saved_l = _swap_eye_state(_eye_state_left)
-                try:
-                    _, l_direction = process_frames(
-                        th_s_l, th_m_l, th_r_l, frame_l_disp, gray_l, darkest_pt_l, False, False)
-                finally:
-                    _restore_eye_state(_eye_state_left, saved_l)
-
-                frame_l_disp = cv2.rotate(frame_l_disp, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                cv2.imshow("Left Eye - Gaze", frame_l_disp)
-
-        # --- Right eye ---
-        if ret_r:
-            frame_r_disp = crop_to_aspect_ratio(frame_r.copy())
-            darkest_pt_r = get_darkest_area(frame_r_disp)
-            if darkest_pt_r is not None:
-                gray_r = cv2.cvtColor(frame_r_disp, cv2.COLOR_BGR2GRAY)
-                dpv_r  = gray_r[darkest_pt_r[1], darkest_pt_r[0]]
-                th_s_r = mask_outside_square(apply_binary_threshold(gray_r, dpv_r,  5), darkest_pt_r, 250)
-                th_m_r = mask_outside_square(apply_binary_threshold(gray_r, dpv_r, 15), darkest_pt_r, 250)
-                th_r_r = mask_outside_square(apply_binary_threshold(gray_r, dpv_r, 25), darkest_pt_r, 250)
-
-                saved_r = _swap_eye_state(_eye_state_right)
-                try:
-                    _, r_direction = process_frames(
-                        th_s_r, th_m_r, th_r_r, frame_r_disp, gray_r, darkest_pt_r, False, False)
-                finally:
-                    _restore_eye_state(_eye_state_right, saved_r)
-
-                frame_r_disp = cv2.rotate(frame_r_disp, cv2.ROTATE_90_CLOCKWISE)
-                cv2.imshow("Right Eye - Gaze", frame_r_disp)
-
-        # --- 3D gaze visualization ---
+        # Optional 3-D gaze visualisation
+        l_dir = results.get('l_dir')
+        r_dir = results.get('r_dir')
         if (VIZ_3D_AVAILABLE
-                and l_direction is not None
-                and r_direction is not None
+                and l_dir is not None
+                and r_dir is not None
                 and frame_idx % viz_update_interval == 0):
             intersection = gaze_viz_3d.compute_gaze_intersection(
-                gaze_viz_3d.LEFT_EYE_POS,  l_direction,
-                gaze_viz_3d.RIGHT_EYE_POS, r_direction,
+                gaze_viz_3d.LEFT_EYE_POS,  l_dir,
+                gaze_viz_3d.RIGHT_EYE_POS, r_dir,
             )
-            gaze_viz_3d.update(l_direction, r_direction, intersection)
+            gaze_viz_3d.update(l_dir, r_dir, intersection)
 
         frame_idx += 1
 
@@ -1108,7 +1122,7 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
 
 # ---------------------------------------------------------------------------
-# Dual-source selection GUI (from pasted function)
+# Dual-source selection GUI
 # ---------------------------------------------------------------------------
 
 def dual_selection_gui():
@@ -1129,8 +1143,8 @@ def dual_selection_gui():
                  values=[str(c) for c in cameras]).pack()
 
     def start_streams():
-        src_l = "http://10.159.67.46:8080?action=stream"
-        src_r = "http://10.159.67.46:8081?action=stream"
+        src_l = "http://10.159.65.65:8080?action=stream"
+        src_r = "http://10.159.65.65:8081?action=stream"
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
 
