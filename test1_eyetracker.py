@@ -1,3 +1,7 @@
+# Before cv2: OpenCV may load Qt; matplotlib must match (not TkAgg vs Qt).
+import matplotlib
+matplotlib.use("Qt5Agg")
+
 import cv2
 import random
 import math
@@ -17,14 +21,18 @@ except ImportError:
     print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
 try:
-    import matplotlib
-    matplotlib.use('TkAgg')  # must be set before any pyplot import; TkAgg is
-                             # compatible with Tkinter which is already running
     import gaze_viz_3d
     VIZ_3D_AVAILABLE = True
 except ImportError:
     VIZ_3D_AVAILABLE = False
     print("gaze_viz_3d module not found. 3D gaze visualization will be disabled.")
+
+try:
+    import serial as _pyserial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    _pyserial = None
+    SERIAL_AVAILABLE = False
 
 ray_lines = [] 
 model_centers = []
@@ -65,7 +73,8 @@ def crop_to_aspect_ratio(image, width=640, height=480):
 
 # Apply thresholding to an image
 def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
-    threshold = darkestPixelValue + addedThreshold
+    threshold = int(darkestPixelValue) + int(addedThreshold)
+    threshold = max(0, min(255, threshold))
     _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
     return thresholded_image
 
@@ -90,7 +99,7 @@ def get_darkest_area(image):
                 for dx in range(0, searchArea, internalSkipSize):
                     if x + dx >= gray.shape[1]:
                         break
-                    current_sum += gray[y + dy][x + dx]
+                    current_sum += int(gray[y + dy, x + dx])
                     num_pixels += 1
 
             if current_sum < min_sum and num_pixels > 0:
@@ -460,8 +469,13 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     if render_cv_window:
         cv2.imshow("Best Thresholded Image Contours on Frame", frame)
 
+    gl_image = None
     if GL_SPHERE_AVAILABLE:
-        gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, model_center_average[0], model_center_average[1])
+        try:
+            gl_image = gl_sphere.update_sphere_rotation(
+                center_x, center_y, model_center_average[0], model_center_average[1])
+        except Exception:
+            gl_image = None
 
     # Call the function
     center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
@@ -738,11 +752,14 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
 
     discriminant = b**2 - 4 * a * c
     if discriminant < 0:
-        # Compute the closest point to the sphere (tangent point approximation)
+        # Closest approach to sphere (ray–sphere miss); use direction toward that point
         t = -np.dot(direction, L) / np.dot(direction, direction)
         intersection_point = origin + t * direction
         intersection_local = intersection_point - sphere_center
-        target_direction = intersection_local / np.linalg.norm(intersection_local)
+        nrm = np.linalg.norm(intersection_local)
+        if nrm < 1e-9:
+            return None, None
+        target_direction = intersection_local / nrm
     else:
         sqrt_disc = np.sqrt(discriminant)
         t1 = (-b - sqrt_disc) / (2 * a)
@@ -758,26 +775,9 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
         if t is None:
             return None, None
 
-    sqrt_disc = np.sqrt(discriminant)
-    t1 = (-b - sqrt_disc) / (2 * a)
-    t2 = (-b + sqrt_disc) / (2 * a)
-
-    t = None
-    if t1 > 0 and t2 > 0:
-        t = min(t1, t2)
-    elif t1 > 0:
-        t = t1
-    elif t2 > 0:
-        t = t2
-    if t is None:
-        return None, None
-
-    # Final intersection point
-    intersection_point = origin + t * direction
-
-    # Convert to local space relative to sphere center
-    intersection_local = intersection_point - sphere_center
-    target_direction = intersection_local / np.linalg.norm(intersection_local)
+        intersection_point = origin + t * direction
+        intersection_local = intersection_point - sphere_center
+        target_direction = intersection_local / np.linalg.norm(intersection_local)
 
     # Local green ring direction
     circle_local_center = np.array([0.0, 0.0, inner_radius])
@@ -1022,6 +1022,296 @@ def _thread_process_eye(cap, eye_state, results, eye_key, mirror_frame=None):
 
 
 # ---------------------------------------------------------------------------
+# Gaze -> base servo (ESP32 / PCA9685 ch 0) via serial
+# ---------------------------------------------------------------------------
+# Firmware expects one line per command: "<pulse_us>\\n" (600–2400), see espfirmware.ino.
+# Set EYE_TRACKER_SERVO_PORT=/dev/cu.usbserial-10 (or your port) to enable.
+#
+# Mapping: horizontal component of each eye's gaze unit vector -> yaw = atan2(dx, dz),
+# fused by averaging available eyes, then linear map yaw -> pulse around SERVO_CENTER_US.
+
+# Calibrated gaze→servo endpoints (µs): look LEFT / CENTER / RIGHT during calibration.
+SERVO_CALIB_LEFT_US = 600
+SERVO_CALIB_CENTER_US = 1500
+SERVO_CALIB_RIGHT_US = 2400
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return float(default)
+
+
+def gaze_yaw_horizontal(direction):
+    """Yaw in radians for base rotation from gaze (ignore vertical): atan2(x, z)."""
+    if direction is None:
+        return None
+    d = np.asarray(direction, dtype=float).ravel()
+    if d.size < 3:
+        return None
+    gx, gz = float(d[0]), float(d[2])
+    if abs(gx) + abs(gz) < 1e-9:
+        return None
+    return math.atan2(gx, gz)
+
+
+def fused_gaze_yaw_rad(l_direction, r_direction):
+    """Average horizontal yaw from left/right gaze vectors when available."""
+    yaws = []
+    yl = gaze_yaw_horizontal(l_direction)
+    yr = gaze_yaw_horizontal(r_direction)
+    if yl is not None:
+        yaws.append(yl)
+    if yr is not None:
+        yaws.append(yr)
+    if not yaws:
+        return None
+    return sum(yaws) / len(yaws)
+
+
+def _dual_calibration_tick(ret_l, frame_l, ret_r, frame_r, mirror_mode, state_l, state_r):
+    """One synchronous dual-eye step using per-eye state dicts (for servo calibration UI)."""
+    if mirror_mode and ret_l:
+        frame_r = cv2.flip(frame_l, 1)
+        ret_r = True
+
+    l_direction = None
+    r_direction = None
+    disp_l = None
+    disp_r = None
+
+    if ret_l:
+        frame_disp = crop_to_aspect_ratio(frame_l.copy())
+        darkest_pt = get_darkest_area(frame_disp)
+        if darkest_pt is not None:
+            gray = cv2.cvtColor(frame_disp, cv2.COLOR_BGR2GRAY)
+            dpv = gray[darkest_pt[1], darkest_pt[0]]
+            th_s = mask_outside_square(apply_binary_threshold(gray, dpv, 5), darkest_pt, 250)
+            th_m = mask_outside_square(apply_binary_threshold(gray, dpv, 15), darkest_pt, 250)
+            th_r = mask_outside_square(apply_binary_threshold(gray, dpv, 25), darkest_pt, 250)
+            _, l_direction = process_frames(
+                th_s, th_m, th_r, frame_disp, gray, darkest_pt, False, False, state=state_l)
+            disp_l = frame_disp
+
+    if ret_r:
+        frame_disp = crop_to_aspect_ratio(frame_r.copy())
+        darkest_pt = get_darkest_area(frame_disp)
+        if darkest_pt is not None:
+            gray = cv2.cvtColor(frame_disp, cv2.COLOR_BGR2GRAY)
+            dpv = gray[darkest_pt[1], darkest_pt[0]]
+            th_s = mask_outside_square(apply_binary_threshold(gray, dpv, 5), darkest_pt, 250)
+            th_m = mask_outside_square(apply_binary_threshold(gray, dpv, 15), darkest_pt, 250)
+            th_r = mask_outside_square(apply_binary_threshold(gray, dpv, 25), darkest_pt, 250)
+            _, r_direction = process_frames(
+                th_s, th_m, th_r, frame_disp, gray, darkest_pt, False, False, state=state_r)
+            disp_r = frame_disp
+
+    return l_direction, r_direction, disp_l, disp_r
+
+
+class CalibratedServoYawMap:
+    """Maps fused horizontal gaze yaw (rad) -> servo pulse using three calibrated samples."""
+
+    def __init__(
+        self,
+        y_left,
+        y_center,
+        y_right,
+        p_left=SERVO_CALIB_LEFT_US,
+        p_center=SERVO_CALIB_CENTER_US,
+        p_right=SERVO_CALIB_RIGHT_US,
+    ):
+        self.y_l = float(y_left)
+        self.y_c = float(y_center)
+        self.y_r = float(y_right)
+        self.p_l = int(p_left)
+        self.p_c = int(p_center)
+        self.p_r = int(p_right)
+
+    def pulse_from_yaw(self, yaw_rad):
+        if yaw_rad is None:
+            return None
+        y = float(yaw_rad)
+        l = self.y_l - self.y_c
+        r = self.y_r - self.y_c
+        if abs(l) < 1e-6 or abs(r) < 1e-6:
+            return None
+        if l * r >= 0:
+            return None
+        s = y - self.y_c
+        if s * l >= 0:
+            t = s / l
+            p = self.p_c + t * (self.p_l - self.p_c)
+        else:
+            t = s / r
+            p = self.p_c + t * (self.p_r - self.p_c)
+        lo = min(self.p_l, self.p_c, self.p_r)
+        hi = max(self.p_l, self.p_c, self.p_r)
+        return int(round(max(lo, min(hi, p))))
+
+
+def run_interactive_servo_yaw_calibration(cap_l, cap_r, mirror_mode, servo_bridge):
+    """Before tracking: record fused yaw at center / left / right gaze. Updates servo_bridge EMA to center."""
+    cal_l = _make_eye_state()
+    cal_r = _make_eye_state()
+    instructions = [
+        ("CENTER", "Look straight ahead (center). Hold steady, then press SPACE to capture."),
+        ("LEFT", "Look as far LEFT as comfortable for the arm. Hold steady, then press SPACE."),
+        ("RIGHT", "Look as far RIGHT as comfortable. Hold steady, then press SPACE."),
+    ]
+    buf = []
+    buf_max = 90
+
+    def _buf_mean():
+        vals = [v for v in buf if v is not None]
+        if len(vals) < 12:
+            return None
+        return float(sum(vals[-45:]) / len(vals[-45:]))
+
+    for tag, msg in instructions:
+        buf.clear()
+        print(f"\n[Calibration: {tag}] {msg}")
+        while True:
+            ret_l, frame_l = cap_l.read()
+            ret_r, frame_r = cap_r.read()
+            if not ret_l and not ret_r:
+                print("Stream ended during calibration.")
+                return None
+            l_dir, r_dir, disp_l, disp_r = _dual_calibration_tick(
+                ret_l, frame_l, ret_r, frame_r, mirror_mode, cal_l, cal_r)
+            y = fused_gaze_yaw_rad(l_dir, r_dir)
+            buf.append(y)
+            if len(buf) > buf_max:
+                buf.pop(0)
+
+            overlay = (msg + "  |  SPACE=capture  Q=abort calibration  S=skip to defaults").split("  |  ")
+            for i, line in enumerate(overlay):
+                if disp_l is not None:
+                    cv2.putText(
+                        disp_l, line, (8, 24 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                    cv2.imshow("Left Eye - Gaze", disp_l)
+                if disp_r is not None:
+                    cv2.putText(
+                        disp_r, line, (8, 24 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                    cv2.imshow("Right Eye - Gaze", disp_r)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                print("Calibration aborted.")
+                return None
+            if key == ord("s"):
+                print("Calibration skipped — using default yaw→servo mapping.")
+                return False
+            if key == ord(" "):
+                m = _buf_mean()
+                if m is None:
+                    print("Not enough valid gaze samples yet — keep holding gaze and try SPACE again.")
+                    continue
+                results[tag] = m
+                print(f"  Recorded {tag}: fused yaw = {m:.4f} rad")
+                break
+
+    y_c = results["CENTER"]
+    y_l = results["LEFT"]
+    y_r = results["RIGHT"]
+    dl = y_l - y_c
+    dr = y_r - y_c
+    if dl * dr >= 0:
+        print(
+            "Calibration failed: LEFT and RIGHT gaze must be on opposite sides of CENTER in yaw space.\n"
+            f"  center={y_c:.4f}  left={y_l:.4f}  right={y_r:.4f}\n"
+            "  Try again or press S during first prompt to skip."
+        )
+        return False
+
+    cal = CalibratedServoYawMap(
+        y_left=y_l,
+        y_center=y_c,
+        y_right=y_r,
+        p_left=SERVO_CALIB_LEFT_US,
+        p_center=SERVO_CALIB_CENTER_US,
+        p_right=SERVO_CALIB_RIGHT_US,
+    )
+    print(
+        f"Calibration OK: left={y_l:.4f}  center={y_c:.4f}  right={y_r:.4f} rad "
+        f"-> pulses {cal.p_l}/{cal.p_c}/{cal.p_r} us"
+    )
+    if servo_bridge is not None:
+        servo_bridge._ema = float(cal.p_c)
+        servo_bridge._last_sent = None
+        try:
+            servo_bridge._ser.write(f"{cal.p_c}\n".encode("ascii"))
+        except _pyserial.SerialException:
+            pass
+    return cal
+
+
+def gaze_yaw_to_servo_pulse_us(yaw_rad):
+    """Map yaw (rad) to PCA9685 pulse length (us). Tune via env."""
+    center = int(_env_float("EYE_TRACKER_SERVO_CENTER", 1500))
+    lo = int(_env_float("EYE_TRACKER_SERVO_MIN", 600))
+    hi = int(_env_float("EYE_TRACKER_SERVO_MAX", 2400))
+    max_yaw = _env_float("EYE_TRACKER_MAX_YAW_RAD", 0.65)
+    flip = _env_float("EYE_TRACKER_GAZE_FLIP", 1.0)
+    if yaw_rad is None or max_yaw <= 1e-6:
+        return None
+    span = min(center - lo, hi - center)
+    delta = flip * yaw_rad * (span / max_yaw)
+    delta = max(-span, min(span, delta))
+    return int(round(center + delta))
+
+
+class BaseServoSerialBridge:
+    """Send smoothed pulse commands to ESP (one int + newline per line)."""
+
+    def __init__(self, port, yaw_calibration=None):
+        if not SERIAL_AVAILABLE or _pyserial is None:
+            raise RuntimeError("pyserial not installed (pip install pyserial)")
+        # write_timeout avoids indefinite block if ESP/USB buffer fills (common "hang").
+        self._ser = _pyserial.Serial(port, 115200, timeout=0.05, write_timeout=0.15)
+        self._ema = _env_float("EYE_TRACKER_SERVO_CENTER", 1500)
+        self._alpha = _env_float("EYE_TRACKER_SERVO_ALPHA", 0.35)
+        self._last_sent = None
+        self._min_delta_send = int(_env_float("EYE_TRACKER_SERVO_MIN_STEP", 2))
+        self._min_send_interval_s = max(0.0, _env_float("EYE_TRACKER_SERVO_MIN_INTERVAL_S", 0.04))
+        self._last_send_mono = 0.0
+        self._yaw_cal = yaw_calibration
+
+    def close(self):
+        try:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+        except Exception:
+            pass
+        self._ser = None
+
+    def update(self, l_direction, r_direction):
+        yaw = fused_gaze_yaw_rad(l_direction, r_direction)
+        if self._yaw_cal is not None:
+            pulse = self._yaw_cal.pulse_from_yaw(yaw)
+        else:
+            pulse = gaze_yaw_to_servo_pulse_us(yaw)
+        if pulse is None:
+            return
+        self._ema = self._alpha * pulse + (1.0 - self._alpha) * self._ema
+        out = int(round(self._ema))
+        if self._last_sent is not None and abs(out - self._last_sent) < self._min_delta_send:
+            return
+        now = time.monotonic()
+        if self._min_send_interval_s > 0 and (now - self._last_send_mono) < self._min_send_interval_s:
+            return
+        try:
+            self._ser.write(f"{out}\n".encode("ascii"))
+        except _pyserial.SerialException:
+            return
+        self._last_sent = out
+        self._last_send_mono = now
+
+
+# ---------------------------------------------------------------------------
 # Dual tracking main loop
 # ---------------------------------------------------------------------------
 
@@ -1047,72 +1337,113 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
     cv2.namedWindow("Left Eye - Gaze",  cv2.WINDOW_NORMAL)
     cv2.namedWindow("Right Eye - Gaze", cv2.WINDOW_NORMAL)
 
+    servo_bridge = None
+    _servo_port = os.environ.get("EYE_TRACKER_SERVO_PORT", "").strip()
+    if _servo_port:
+        if SERIAL_AVAILABLE:
+            try:
+                servo_bridge = BaseServoSerialBridge(_servo_port)
+                print(f"Base servo serial: {_servo_port} (set EYE_TRACKER_SERVO_PORT empty to disable)")
+            except Exception as ex:
+                print(f"Base servo serial failed ({ex}); continuing without servo.")
+        else:
+            print("EYE_TRACKER_SERVO_PORT set but pyserial not installed; pip install pyserial")
+
+    if servo_bridge is not None and not os.environ.get("EYE_TRACKER_SKIP_SERVO_CALIB", "").strip():
+        print("\n--- Servo yaw calibration (fused gaze atan2(dx,dz)) ---")
+        print("  SPACE = capture average | S = skip (use env defaults) | Q = quit app")
+        cal = run_interactive_servo_yaw_calibration(cap_l, cap_r, mirror_mode, servo_bridge)
+        if cal is None:
+            servo_bridge.close()
+            servo_bridge = None
+            cap_l.release()
+            cap_r.release()
+            cv2.destroyAllWindows()
+            print("Calibration aborted; exiting.")
+            return
+        if cal is not False:
+            servo_bridge._yaw_cal = cal
+
+    if GL_SPHERE_AVAILABLE:
+        gl_sphere.start_gl_window()
+
     if VIZ_3D_AVAILABLE:
         gaze_viz_3d.start()
 
     viz_update_interval = 3
     frame_idx = 0
 
-    while True:
-        results = {}
+    try:
+        while True:
+            results = {}
 
-        if mirror_mode:
-            # Read the single source once and hand the same raw frame to both threads
-            ret_pre, frame_pre = cap_l.read()
-            mirror_src = frame_pre if ret_pre else None
-        else:
-            mirror_src = None
+            if mirror_mode:
+                # Read the single source once and hand the same raw frame to both threads
+                ret_pre, frame_pre = cap_l.read()
+                mirror_src = frame_pre if ret_pre else None
+            else:
+                mirror_src = None
 
-        t_l = threading.Thread(
-            target=_thread_process_eye,
-            args=(cap_l, eye_state_left,  results, 'l'),
-            kwargs={'mirror_frame': mirror_src if mirror_mode else None},
-            daemon=True,
-        )
-        t_r = threading.Thread(
-            target=_thread_process_eye,
-            args=(cap_r, eye_state_right, results, 'r'),
-            kwargs={'mirror_frame': mirror_src if mirror_mode else None},
-            daemon=True,
-        )
-
-        t_l.start()
-        t_r.start()
-        t_l.join()
-        t_r.join()
-
-        if not results.get('l_ret') and not results.get('r_ret'):
-            break
-
-        # Display (main thread only — required on most platforms)
-        frame_l = results.get('l_frame')
-        frame_r = results.get('r_frame')
-
-        if frame_l is not None:
-            cv2.imshow("Left Eye - Gaze",  frame_l)
-        if frame_r is not None:
-            cv2.imshow("Right Eye - Gaze", frame_r)
-
-        # Optional 3-D gaze visualisation
-        l_dir = results.get('l_dir')
-        r_dir = results.get('r_dir')
-        if (VIZ_3D_AVAILABLE
-                and l_dir is not None
-                and r_dir is not None
-                and frame_idx % viz_update_interval == 0):
-            intersection = gaze_viz_3d.compute_gaze_intersection(
-                gaze_viz_3d.LEFT_EYE_POS,  l_dir,
-                gaze_viz_3d.RIGHT_EYE_POS, r_dir,
+            t_l = threading.Thread(
+                target=_thread_process_eye,
+                args=(cap_l, eye_state_left,  results, 'l'),
+                kwargs={'mirror_frame': mirror_src if mirror_mode else None},
+                daemon=True,
             )
-            gaze_viz_3d.update(l_dir, r_dir, intersection)
+            t_r = threading.Thread(
+                target=_thread_process_eye,
+                args=(cap_r, eye_state_right, results, 'r'),
+                kwargs={'mirror_frame': mirror_src if mirror_mode else None},
+                daemon=True,
+            )
 
-        frame_idx += 1
+            t_l.start()
+            t_r.start()
+            t_l.join()
+            t_r.join()
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord(' '):
-            cv2.waitKey(0)
+            if not results.get('l_ret') and not results.get('r_ret'):
+                break
+
+            # Display (main thread only — required on most platforms)
+            frame_l = results.get('l_frame')
+            frame_r = results.get('r_frame')
+
+            if frame_l is not None:
+                cv2.imshow("Left Eye - Gaze",  frame_l)
+            if frame_r is not None:
+                cv2.imshow("Right Eye - Gaze", frame_r)
+
+            # Optional 3-D gaze visualisation
+            l_dir = results.get('l_dir')
+            r_dir = results.get('r_dir')
+            if (VIZ_3D_AVAILABLE
+                    and l_dir is not None
+                    and r_dir is not None
+                    and frame_idx % viz_update_interval == 0):
+                intersection = gaze_viz_3d.compute_gaze_intersection(
+                    gaze_viz_3d.LEFT_EYE_POS,  l_dir,
+                    gaze_viz_3d.RIGHT_EYE_POS, r_dir,
+                )
+                gaze_viz_3d.update(l_dir, r_dir, intersection)
+
+            frame_idx += 1
+
+            if servo_bridge is not None:
+                try:
+                    servo_bridge.update(l_dir, r_dir)
+                except Exception as ex:
+                    print(f"Base servo update error: {ex}")
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord(' '):
+                cv2.waitKey(0)
+
+    finally:
+        if servo_bridge is not None:
+            servo_bridge.close()
 
     cap_l.release()
     cap_r.release()
