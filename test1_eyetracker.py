@@ -1,3 +1,7 @@
+# Before cv2: OpenCV may load Qt; matplotlib must match (not TkAgg vs Qt).
+import matplotlib
+matplotlib.use("Qt5Agg")
+
 import cv2
 import random
 import math
@@ -18,9 +22,6 @@ except ImportError:
     print("gl_sphere module not found. OpenGL rendering will be disabled.")
 
 try:
-    import matplotlib
-    matplotlib.use('TkAgg')  # must be set before any pyplot import; TkAgg is
-                             # compatible with Tkinter which is already running
     import gaze_viz_3d
     VIZ_3D_AVAILABLE = True
 except ImportError:
@@ -32,7 +33,7 @@ model_centers = []
 max_rays = 100
 prev_model_center_avg = (320,240)
 max_observed_distance = 0  # Initialize adaptive radius
-cached_threshold_idx = None   # 0/1/2 once a good threshold level is found per eye
+cached_threshold_idx = None   # 0/1/2 once a good threshold level is found (single-eye path)
 _suppress_internal_windows = False  # set True in dual mode to hide internal imshows
 
 # Function to detect available cameras
@@ -66,7 +67,8 @@ def crop_to_aspect_ratio(image, width=640, height=480):
 
 # Apply thresholding to an image
 def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
-    threshold = darkestPixelValue + addedThreshold
+    threshold = int(darkestPixelValue) + int(addedThreshold)
+    threshold = max(0, min(255, threshold))
     _, thresholded_image = cv2.threshold(image, threshold, 255, cv2.THRESH_BINARY_INV)
     return thresholded_image
 
@@ -91,7 +93,7 @@ def get_darkest_area(image):
                 for dx in range(0, searchArea, internalSkipSize):
                     if x + dx >= gray.shape[1]:
                         break
-                    current_sum += gray[y + dy][x + dx]
+                    current_sum += int(gray[y + dy, x + dx])
                     num_pixels += 1
 
             if current_sum < min_sum and num_pixels > 0:
@@ -179,7 +181,6 @@ def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thr
                     largest_contour = contour
 
     return [largest_contour] if largest_contour is not None else []
-
 #Fits an ellipse to the optimized contours and draws it on the image.
 def fit_and_draw_ellipses(image, optimized_contours, color):
     if len(optimized_contours) >= 5:
@@ -281,21 +282,23 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     # otherwise fall back to the legacy module-level globals (single-eye mode).
     # ---------------------------------------------------------------------------
     if state is not None:
-        _ray_lines            = state['ray_lines']
-        _model_centers        = state['model_centers']
-        _stored_intersections = state['stored_intersections']
+        _ray_lines             = state['ray_lines']
+        _model_centers         = state['model_centers']
+        _stored_intersections  = state['stored_intersections']
         _max_observed_distance = state['max_observed_distance']
         _prev_model_center_avg = state['prev_model_center_avg']
         _cached_threshold_idx  = state['cached_threshold_idx']
     else:
         global ray_lines, model_centers, stored_intersections
         global max_observed_distance, prev_model_center_avg, cached_threshold_idx
-        _ray_lines            = ray_lines
-        _model_centers        = model_centers
-        _stored_intersections = stored_intersections
+        _ray_lines             = ray_lines
+        _model_centers         = model_centers
+        _stored_intersections  = stored_intersections
         _max_observed_distance = max_observed_distance
         _prev_model_center_avg = prev_model_center_avg
         _cached_threshold_idx  = cached_threshold_idx
+
+    global max_rays
 
     direction = None
     center_x = None
@@ -458,11 +461,21 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
         # Draw the extended gaze line
         cv2.line(frame, (center_x, center_y), (extended_x, extended_y), (200, 255, 0), 3) 
 
+
     if render_cv_window:
         cv2.imshow("Best Thresholded Image Contours on Frame", frame)
 
-    if GL_SPHERE_AVAILABLE:
-        gl_image = gl_sphere.update_sphere_rotation(center_x, center_y, model_center_average[0], model_center_average[1])
+
+    # Qt GL must run on the main thread only — skip when process_frames is used
+    # from per-eye worker threads (state is not None).
+    gl_image = None
+    if GL_SPHERE_AVAILABLE and state is None:
+        try:
+            gl_image = gl_sphere.update_sphere_rotation(
+                center_x, center_y, model_center_average[0], model_center_average[1])
+        except Exception:
+            gl_image = None
+    #cv2.circle(frame, (center_x, center_y), 22, (255, 255, 0), -1)  # Draw intersection center
 
     # Call the function
     center, direction = compute_gaze_vector(center_x, center_y, model_center_average[0], model_center_average[1])
@@ -619,7 +632,7 @@ def compute_average_intersection(frame, ray_lines_arg, stored_intersections_arg,
                 intersections.append(intersection)
                 stored_intersections_arg.append(intersection)  # Store valid intersections
 
-    # Prune intersections if stored list exceeds M
+    # Prune intersections if stored list exceeds M (mutate in place so caller sees it)
     if len(stored_intersections_arg) > M:
         stored_intersections_arg[:] = prune_intersections(stored_intersections_arg, M)
 
@@ -629,6 +642,7 @@ def compute_average_intersection(frame, ray_lines_arg, stored_intersections_arg,
     # Compute the average intersection point
     avg_x = np.mean([pt[0] for pt in stored_intersections_arg])
     avg_y = np.mean([pt[1] for pt in stored_intersections_arg])
+
 
     return (int(avg_x), int(avg_y))
 
@@ -739,11 +753,14 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
 
     discriminant = b**2 - 4 * a * c
     if discriminant < 0:
-        # Compute the closest point to the sphere (tangent point approximation)
+        # Closest approach to sphere (ray–sphere miss); use direction toward that point
         t = -np.dot(direction, L) / np.dot(direction, direction)
         intersection_point = origin + t * direction
         intersection_local = intersection_point - sphere_center
-        target_direction = intersection_local / np.linalg.norm(intersection_local)
+        nrm = np.linalg.norm(intersection_local)
+        if nrm < 1e-9:
+            return None, None
+        target_direction = intersection_local / nrm
     else:
         sqrt_disc = np.sqrt(discriminant)
         t1 = (-b - sqrt_disc) / (2 * a)
@@ -759,26 +776,9 @@ def compute_gaze_vector(x, y, center_x, center_y, screen_width=640, screen_heigh
         if t is None:
             return None, None
 
-    sqrt_disc = np.sqrt(discriminant)
-    t1 = (-b - sqrt_disc) / (2 * a)
-    t2 = (-b + sqrt_disc) / (2 * a)
-
-    t = None
-    if t1 > 0 and t2 > 0:
-        t = min(t1, t2)
-    elif t1 > 0:
-        t = t1
-    elif t2 > 0:
-        t = t2
-    if t is None:
-        return None, None
-
-    # Final intersection point
-    intersection_point = origin + t * direction
-
-    # Convert to local space relative to sphere center
-    intersection_local = intersection_point - sphere_center
-    target_direction = intersection_local / np.linalg.norm(intersection_local)
+        intersection_point = origin + t * direction
+        intersection_local = intersection_point - sphere_center
+        target_direction = intersection_local / np.linalg.norm(intersection_local)
 
     # Local green ring direction
     circle_local_center = np.array([0.0, 0.0, inner_radius])
@@ -929,24 +929,24 @@ def selection_gui():
     global selected_camera
     cameras = detect_cameras()
 
+    # Create Tkinter window
     root = tk.Tk()
     root.title("Select Input Source")
     tk.Label(root, text="Orlosky Eye Tracker 3D", font=("Arial", 12, "bold")).pack(pady=10)
+
     tk.Label(root, text="Select Camera:").pack(pady=5)
 
     selected_camera = tk.StringVar()
     selected_camera.set(str(cameras[0]) if cameras else "No cameras found")
 
-    camera_dropdown = ttk.Combobox(root, textvariable=selected_camera,
-                                   values=[str(cam) for cam in cameras])
+    camera_dropdown = ttk.Combobox(root, textvariable=selected_camera, values=[str(cam) for cam in cameras])
     camera_dropdown.pack(pady=5)
 
-    tk.Button(root, text="Start Camera",
-              command=lambda: [root.destroy(), process_camera()]).pack(pady=5)
-    tk.Button(root, text="Browse Video",
-              command=lambda: [root.destroy(), process_video()]).pack(pady=5)
+    tk.Button(root, text="Start Camera", command=lambda: [root.destroy(), process_camera()]).pack(pady=5)
+    tk.Button(root, text="Browse Video", command=lambda: [root.destroy(), process_video()]).pack(pady=5)
 
     if GL_SPHERE_AVAILABLE:
+        # Start GL sphere window once
         app = gl_sphere.start_gl_window()
 
     root.mainloop()
@@ -1000,7 +1000,7 @@ def _thread_process_eye(cap, eye_state, results, eye_key, mirror_frame=None):
 
     results[ret_key] = True
 
-    # --- Pre-processing (identical to process_frame, but passes eye_state) ---
+    # --- Pre-processing (identical to the single-eye path, but passes eye_state) ---
     frame_disp = crop_to_aspect_ratio(frame.copy())
     darkest_pt = get_darkest_area(frame_disp)
     if darkest_pt is None:
@@ -1027,7 +1027,7 @@ def _thread_process_eye(cap, eye_state, results, eye_key, mirror_frame=None):
 # ---------------------------------------------------------------------------
 
 def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
-    """Open two video sources and process both eyes concurrently each frame."""
+    """Open two video sources and display gaze vectors on both simultaneously."""
     cap_l = cv2.VideoCapture(src_left)
     cap_r = cv2.VideoCapture(src_right if (src_right and not mirror_mode) else src_left)
 
@@ -1048,101 +1048,100 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
     cv2.namedWindow("Left Eye - Gaze",  cv2.WINDOW_NORMAL)
     cv2.namedWindow("Right Eye - Gaze", cv2.WINDOW_NORMAL)
 
+    if GL_SPHERE_AVAILABLE:
+        gl_sphere.start_gl_window()
+
     if VIZ_3D_AVAILABLE:
         gaze_viz_3d.start()
 
+    # Throttle matplotlib updates so the 3D viz doesn't steal time from cv2
     viz_update_interval = 3
     frame_idx = 0
 
-    while True:
-        results = {}
+    try:
+        while True:
+            results = {}
 
-        if mirror_mode:
-            # Read the single source once and hand the same raw frame to both threads
-            ret_pre, frame_pre = cap_l.read()
-            mirror_src = frame_pre if ret_pre else None
-        else:
-            mirror_src = None
+            if mirror_mode:
+                # Read the single source once and hand the same raw frame to both threads
+                ret_pre, frame_pre = cap_l.read()
+                mirror_src = frame_pre if ret_pre else None
+            else:
+                mirror_src = None
 
-        t_l = threading.Thread(
-            target=_thread_process_eye,
-            args=(cap_l, eye_state_left,  results, 'l'),
-            kwargs={'mirror_frame': mirror_src if mirror_mode else None},
-            daemon=True,
-        )
-        t_r = threading.Thread(
-            target=_thread_process_eye,
-            args=(cap_r, eye_state_right, results, 'r'),
-            kwargs={'mirror_frame': mirror_src if mirror_mode else None},
-            daemon=True,
-        )
+            t_l = threading.Thread(
+                target=_thread_process_eye,
+                args=(cap_l, eye_state_left,  results, 'l'),
+                kwargs={'mirror_frame': mirror_src if mirror_mode else None},
+                daemon=True,
+            )
+            t_r = threading.Thread(
+                target=_thread_process_eye,
+                args=(cap_r, eye_state_right, results, 'r'),
+                kwargs={'mirror_frame': mirror_src if mirror_mode else None},
+                daemon=True,
+            )
 
-        t_l.start()
-        t_r.start()
-        t_l.join()
-        t_r.join()
+            t_l.start()
+            t_r.start()
+            t_l.join()
+            t_r.join()
 
-        if not results.get('l_ret') and not results.get('r_ret'):
-            break
+            if not results.get('l_ret') and not results.get('r_ret'):
+                break
 
-        # Display (main thread only — required on most platforms)
-        frame_l = results.get('l_frame')
-        frame_r = results.get('r_frame')
+            # Display (main thread only — required on most platforms)
+            frame_l_disp = results.get('l_frame')
+            frame_r_disp = results.get('r_frame')
 
-        if frame_l is not None:
-            cv2.imshow("Left Eye - Gaze",  frame_l)
-        if frame_r is not None:
-            cv2.imshow("Right Eye - Gaze", frame_r)
+            if frame_l_disp is not None:
+                frame_l_disp = cv2.rotate(frame_l_disp, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                cv2.imshow("Left Eye - Gaze",  frame_l_disp)
+            if frame_r_disp is not None:
+                frame_r_disp = cv2.rotate(frame_r_disp, cv2.ROTATE_90_CLOCKWISE)
+                cv2.imshow("Right Eye - Gaze", frame_r_disp)
 
-        # --- World-space gaze ---
-        if l_direction is not None and r_direction is not None:
-            result = gaze_world.compute_world_gaze_projected(l_direction, r_direction)
-            if result is not None:
-                tx, ty, tz = result['target_world']
-                print(f"Gaze target (world): "
-                      f"X={tx:+.2f}  Y={ty:.2f}  Z={tz:+.2f} m  "
-                      f"| height={result['height']:.2f} m  "
-                      f"| dist={result['distance']:.2f} m  "
-                      f"| miss={result['miss_distance']*100:.1f} cm")
+            l_direction = results.get('l_dir')
+            r_direction = results.get('r_dir')
 
-                if VIZ_3D_AVAILABLE and frame_idx % viz_update_interval == 0:
-                    gaze_viz_3d.update(
-                        result['left_origin_world'],
-                        result['left_direction_world'],
-                        result['right_origin_world'],
-                        result['right_direction_world'],
-                        result['target_world'],
-                    )
+            # --- World-space gaze (main thread; gaze_viz_3d/matplotlib must be on main) ---
+            if l_direction is not None and r_direction is not None:
+                result = gaze_world.compute_world_gaze_projected(l_direction, r_direction)
+                if result is not None:
+                    tx, ty, tz = result['target_world']
+                    print(f"Gaze target (world): "
+                          f"X={tx:+.2f}  Y={ty:.2f}  Z={tz:+.2f} m  "
+                          f"| height={result['height']:.2f} m  "
+                          f"| dist={result['distance']:.2f} m  "
+                          f"| miss={result['miss_distance']*100:.1f} cm")
 
-        frame_idx += 1
+                    if VIZ_3D_AVAILABLE and frame_idx % viz_update_interval == 0:
+                        gaze_viz_3d.update(
+                            result['left_origin_world'],
+                            result['left_direction_world'],
+                            result['right_origin_world'],
+                            result['right_direction_world'],
+                            result['target_world'],
+                        )
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord(' '):
-            cv2.waitKey(0)
+            frame_idx += 1
 
-    cap_l.release()
-    cap_r.release()
-    cv2.destroyAllWindows()
-    if VIZ_3D_AVAILABLE:
-        gaze_viz_3d.stop()
-
-        # key = cv2.waitKey(1) & 0xFF
-        # if key == ord('q'):
-        #     break
-        # elif key == ord(' '):
-        #     cv2.waitKey(0)
-
-    cap_l.release()
-    cap_r.release()
-    cv2.destroyAllWindows()
-    if VIZ_3D_AVAILABLE:
-        gaze_viz_3d.stop()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord(' '):
+                cv2.waitKey(0)
+    finally:
+        _suppress_internal_windows = False
+        cap_l.release()
+        cap_r.release()
+        cv2.destroyAllWindows()
+        if VIZ_3D_AVAILABLE:
+            gaze_viz_3d.stop()
 
 
 # ---------------------------------------------------------------------------
-# Dual-source selection GUI
+# Dual-source selection GUI (from pasted function)
 # ---------------------------------------------------------------------------
 
 def dual_selection_gui():
