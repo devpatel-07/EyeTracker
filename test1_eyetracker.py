@@ -469,8 +469,10 @@ def process_frames(thresholded_image_strict, thresholded_image_medium, threshold
     if render_cv_window:
         cv2.imshow("Best Thresholded Image Contours on Frame", frame)
 
+    # Qt GL must run on the main thread only — skip when process_frames is used
+    # from per-eye worker threads (state is not None).
     gl_image = None
-    if GL_SPHERE_AVAILABLE:
+    if GL_SPHERE_AVAILABLE and state is None:
         try:
             gl_image = gl_sphere.update_sphere_rotation(
                 center_x, center_y, model_center_average[0], model_center_average[1])
@@ -1027,8 +1029,16 @@ def _thread_process_eye(cap, eye_state, results, eye_key, mirror_frame=None):
 # Firmware expects one line per command: "<pulse_us>\\n" (600–2400), see espfirmware.ino.
 # Set EYE_TRACKER_SERVO_PORT=/dev/cu.usbserial-10 (or your port) to enable.
 #
-# Mapping: horizontal component of each eye's gaze unit vector -> yaw = atan2(dx, dz),
-# fused by averaging available eyes, then linear map yaw -> pulse around SERVO_CENTER_US.
+# Mapping: horizontal component of gaze unit vector -> yaw = atan2(dx, dz).
+# Fusion: average gaze *vectors* (then renormalize) when both eyes are valid — more natural than
+# averaging per-eye atan2. Then linear map yaw -> pulse around SERVO_CENTER_US.
+#
+# Env tuning (bridge): EYE_TRACKER_SERVO_ALPHA (EMA on pulse, default snappier ~0.55),
+# EYE_TRACKER_SERVO_MIN_STEP (min pulse delta before send, default 1),
+# EYE_TRACKER_SERVO_MIN_INTERVAL_S (min seconds between sends, default ~0.02),
+# EYE_TRACKER_SERVO_SMOOTH_FRAMES (median yaw over last N frames, default 3; set 1 to disable),
+# EYE_TRACKER_SERVO_RX_PURGE_EVERY (clear serial RX buffer every N writes if ESP prints; default 24).
+# Ctrl+C during dual tracking prints a session report (frame rate, missing gaze, servo counters, calibration, env).
 
 # Calibrated gaze→servo endpoints (µs): look LEFT / CENTER / RIGHT during calibration.
 SERVO_CALIB_LEFT_US = 600
@@ -1057,17 +1067,30 @@ def gaze_yaw_horizontal(direction):
 
 
 def fused_gaze_yaw_rad(l_direction, r_direction):
-    """Average horizontal yaw from left/right gaze vectors when available."""
-    yaws = []
-    yl = gaze_yaw_horizontal(l_direction)
-    yr = gaze_yaw_horizontal(r_direction)
-    if yl is not None:
-        yaws.append(yl)
-    if yr is not None:
-        yaws.append(yr)
-    if not yaws:
+    """Horizontal yaw from fused gaze: average 3D gaze vectors when possible, then atan2(x, z).
+
+    Averaging atan2 per-eye can mute motion when the eyes share direction but disagree in phase;
+    vector fusion matches a simple cyclopean estimate and tends to track head/look changes better.
+    """
+    vecs = []
+    for d in (l_direction, r_direction):
+        if d is None:
+            continue
+        v = np.asarray(d, dtype=np.float64).ravel()
+        if v.size < 3:
+            continue
+        gx, gy, gz = float(v[0]), float(v[1]), float(v[2])
+        if abs(gx) + abs(gz) < 1e-9:
+            continue
+        vecs.append(np.array([gx, gy, gz], dtype=np.float64))
+    if not vecs:
         return None
-    return sum(yaws) / len(yaws)
+    v = vecs[0] + vecs[1] if len(vecs) > 1 else vecs[0].copy()
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return None
+    v = v / n
+    return math.atan2(float(v[0]), float(v[2]))
 
 
 def _dual_calibration_tick(ret_l, frame_l, ret_r, frame_r, mirror_mode, state_l, state_r):
@@ -1162,6 +1185,7 @@ def run_interactive_servo_yaw_calibration(cap_l, cap_r, mirror_mode, servo_bridg
     ]
     buf = []
     buf_max = 90
+    results = {}  # CENTER / LEFT / RIGHT -> captured fused yaw (rad)
 
     def _buf_mean():
         vals = [v for v in buf if v is not None]
@@ -1249,6 +1273,53 @@ def run_interactive_servo_yaw_calibration(cap_l, cap_r, mirror_mode, servo_bridg
     return cal
 
 
+def _tracking_env_lines():
+    """Env vars that affect tracking/servo (for post-run diagnostics)."""
+    keys = sorted(k for k in os.environ if k.startswith("EYE_TRACKER_"))
+    if not keys:
+        return ["  (no EYE_TRACKER_* env overrides set)"]
+    return [f"  {k}={os.environ[k]!r}" for k in keys]
+
+
+def print_tracking_session_shutdown_report(
+    *,
+    reason,
+    elapsed_s,
+    frame_idx,
+    mirror_mode,
+    servo_bridge,
+    l_dir_none=0,
+    r_dir_none=0,
+    both_dir_none=0,
+):
+    """Print gaze/servo/session stats (e.g. after Ctrl+C) to tune the pipeline."""
+    print("\n" + "=" * 64)
+    print(f"Eye tracker — session report ({reason})")
+    print("=" * 64)
+    print(f"  mirror_mode:        {mirror_mode}")
+    print(f"  frames processed:  {frame_idx}")
+    if elapsed_s > 0.5:
+        print(f"  wall time:         {elapsed_s:.1f} s  (~{frame_idx / elapsed_s:.2f} dual-frames/s)")
+    else:
+        print(f"  wall time:         {elapsed_s:.3f} s")
+    print("  gaze vectors missing (main loop, after threading):")
+    print(f"    left None:         {l_dir_none} frames")
+    print(f"    right None:        {r_dir_none} frames")
+    print(f"    both None:         {both_dir_none} frames")
+    if servo_bridge is not None:
+        print("-" * 64)
+        for line in servo_bridge.shutdown_report_lines():
+            print(line)
+    else:
+        print("  servo:             (disabled — EYE_TRACKER_SERVO_PORT not set or init failed)")
+    print("-" * 64)
+    print("Relevant environment:")
+    for line in _tracking_env_lines():
+        print(line)
+    print("=" * 64)
+    print("Tip: set EYE_TRACKER_SERVO_DEBUG_EVERY=30 for per-send yaw/pulse logs while running.\n")
+
+
 def gaze_yaw_to_servo_pulse_us(yaw_rad):
     """Map yaw (rad) to PCA9685 pulse length (us). Tune via env."""
     center = int(_env_float("EYE_TRACKER_SERVO_CENTER", 1500))
@@ -1273,12 +1344,34 @@ class BaseServoSerialBridge:
         # write_timeout avoids indefinite block if ESP/USB buffer fills (common "hang").
         self._ser = _pyserial.Serial(port, 115200, timeout=0.05, write_timeout=0.15)
         self._ema = _env_float("EYE_TRACKER_SERVO_CENTER", 1500)
-        self._alpha = _env_float("EYE_TRACKER_SERVO_ALPHA", 0.35)
+        self._alpha = _env_float("EYE_TRACKER_SERVO_ALPHA", 0.55)
         self._last_sent = None
-        self._min_delta_send = int(_env_float("EYE_TRACKER_SERVO_MIN_STEP", 2))
-        self._min_send_interval_s = max(0.0, _env_float("EYE_TRACKER_SERVO_MIN_INTERVAL_S", 0.04))
+        self._min_delta_send = max(0, int(_env_float("EYE_TRACKER_SERVO_MIN_STEP", 1)))
+        self._min_send_interval_s = max(0.0, _env_float("EYE_TRACKER_SERVO_MIN_INTERVAL_S", 0.02))
         self._last_send_mono = 0.0
         self._yaw_cal = yaw_calibration
+        self._yaw_smooth_n = max(1, int(_env_float("EYE_TRACKER_SERVO_SMOOTH_FRAMES", 3)))
+        self._yaw_buf = []
+        self._rx_purge_every = max(0, int(_env_float("EYE_TRACKER_SERVO_RX_PURGE_EVERY", 24)))
+        self._write_count = 0
+        self._debug_every = max(0, int(_env_float("EYE_TRACKER_SERVO_DEBUG_EVERY", 0)))
+        self._debug_i = 0
+        self._st = {
+            "updates": 0,
+            "yaw_none": 0,
+            "pulse_invalid": 0,
+            "skip_min_step": 0,
+            "skip_interval": 0,
+            "writes": 0,
+            "write_errors": 0,
+            "yaw_min": None,
+            "yaw_max": None,
+            "pulse_raw_min": None,
+            "pulse_raw_max": None,
+            "ema_out_min": None,
+            "ema_out_max": None,
+            "last_written_pulse": None,
+        }
 
     def close(self):
         try:
@@ -1288,27 +1381,112 @@ class BaseServoSerialBridge:
             pass
         self._ser = None
 
-    def update(self, l_direction, r_direction):
-        yaw = fused_gaze_yaw_rad(l_direction, r_direction)
-        if self._yaw_cal is not None:
-            pulse = self._yaw_cal.pulse_from_yaw(yaw)
+    def shutdown_report_lines(self):
+        """Human-readable lines for Ctrl+C / debug (servo path health)."""
+        st = self._st
+        lines = [
+            "Servo bridge (BaseServoSerialBridge):",
+            f"  update() calls:      {st['updates']}",
+            f"  fused yaw missing:   {st['yaw_none']}  (no gaze → no pulse)",
+            f"  pulse map invalid:   {st['pulse_invalid']}  (yaw present but map returned None)",
+            f"  skipped (min step):  {st['skip_min_step']}",
+            f"  skipped (interval): {st['skip_interval']}",
+            f"  serial writes OK:    {st['writes']}",
+            f"  serial write errors: {st['write_errors']}",
+            f"  tuning: alpha={self._alpha:g}  min_step={self._min_delta_send}  "
+            f"min_interval_s={self._min_send_interval_s:g}  smooth_frames={self._yaw_smooth_n}",
+        ]
+        ym, yx = st["yaw_min"], st["yaw_max"]
+        if ym is not None and yx is not None:
+            lines.append(f"  fused yaw rad (min…max over valid frames): {ym:.5f} … {yx:.5f}  (span {yx - ym:.5f})")
         else:
-            pulse = gaze_yaw_to_servo_pulse_us(yaw)
-        if pulse is None:
+            lines.append("  fused yaw rad:       (no valid samples in window)")
+        pr0, pr1 = st["pulse_raw_min"], st["pulse_raw_max"]
+        if pr0 is not None:
+            lines.append(f"  map pulse µs (min…max): {pr0} … {pr1}")
+        eo0, eo1 = st["ema_out_min"], st["ema_out_max"]
+        if eo0 is not None:
+            lines.append(f"  EMA output µs (min…max before send gate): {eo0} … {eo1}")
+        if st["last_written_pulse"] is not None:
+            lines.append(f"  last value written:  {st['last_written_pulse']} µs")
+        cal = self._yaw_cal
+        if cal is not None:
+            lines.append(
+                "  calibration map:   "
+                f"y_left={cal.y_l:.5f}  y_center={cal.y_c:.5f}  y_right={cal.y_r:.5f} rad"
+            )
+            lines.append(
+                f"                       → pulse {cal.p_l} / {cal.p_c} / {cal.p_r} µs"
+            )
+        else:
+            lines.append("  calibration map:   (none — using gaze_yaw_to_servo_pulse_us + env)")
+        return lines
+
+    def update(self, l_direction, r_direction):
+        st = self._st
+        st["updates"] += 1
+        yaw = fused_gaze_yaw_rad(l_direction, r_direction)
+        if yaw is None:
+            self._yaw_buf.clear()
+            yaw_in = None
+        elif self._yaw_smooth_n > 1:
+            self._yaw_buf.append(float(yaw))
+            if len(self._yaw_buf) > self._yaw_smooth_n:
+                self._yaw_buf.pop(0)
+            yaw_in = float(np.median(self._yaw_buf))
+        else:
+            yaw_in = yaw
+        if yaw_in is None:
+            st["yaw_none"] += 1
             return
+        ym, yx = st["yaw_min"], st["yaw_max"]
+        st["yaw_min"] = yaw_in if ym is None else min(ym, yaw_in)
+        st["yaw_max"] = yaw_in if yx is None else max(yx, yaw_in)
+        if self._yaw_cal is not None:
+            pulse = self._yaw_cal.pulse_from_yaw(yaw_in)
+        else:
+            pulse = gaze_yaw_to_servo_pulse_us(yaw_in)
+        if pulse is None:
+            st["pulse_invalid"] += 1
+            return
+        pr0, pr1 = st["pulse_raw_min"], st["pulse_raw_max"]
+        pv = int(pulse)
+        st["pulse_raw_min"] = pv if pr0 is None else min(pr0, pv)
+        st["pulse_raw_max"] = pv if pr1 is None else max(pr1, pv)
         self._ema = self._alpha * pulse + (1.0 - self._alpha) * self._ema
         out = int(round(self._ema))
+        e0, e1 = st["ema_out_min"], st["ema_out_max"]
+        st["ema_out_min"] = out if e0 is None else min(e0, out)
+        st["ema_out_max"] = out if e1 is None else max(e1, out)
         if self._last_sent is not None and abs(out - self._last_sent) < self._min_delta_send:
+            st["skip_min_step"] += 1
             return
         now = time.monotonic()
         if self._min_send_interval_s > 0 and (now - self._last_send_mono) < self._min_send_interval_s:
+            st["skip_interval"] += 1
             return
         try:
+            if self._rx_purge_every > 0:
+                self._write_count += 1
+                if self._write_count >= self._rx_purge_every:
+                    self._write_count = 0
+                    try:
+                        self._ser.reset_input_buffer()
+                    except Exception:
+                        pass
             self._ser.write(f"{out}\n".encode("ascii"))
         except _pyserial.SerialException:
+            st["write_errors"] += 1
             return
+        st["writes"] += 1
+        st["last_written_pulse"] = out
         self._last_sent = out
         self._last_send_mono = now
+        if self._debug_every > 0:
+            self._debug_i += 1
+            if self._debug_i % self._debug_every == 0:
+                ys = f"yaw={yaw_in:.4f}" if yaw_in is not None else "yaw=None"
+                print(f"[servo] {ys} pulse={pulse} ema->out={out}")
 
 
 # ---------------------------------------------------------------------------
@@ -1372,6 +1550,8 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
     viz_update_interval = 3
     frame_idx = 0
+    session_start = time.monotonic()
+    gaze_stats = {"l_none": 0, "r_none": 0, "both_none": 0}
 
     try:
         while True:
@@ -1417,6 +1597,12 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
             # Optional 3-D gaze visualisation
             l_dir = results.get('l_dir')
             r_dir = results.get('r_dir')
+            if l_dir is None:
+                gaze_stats["l_none"] += 1
+            if r_dir is None:
+                gaze_stats["r_none"] += 1
+            if l_dir is None and r_dir is None:
+                gaze_stats["both_none"] += 1
             if (VIZ_3D_AVAILABLE
                     and l_dir is not None
                     and r_dir is not None
@@ -1441,6 +1627,17 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
             elif key == ord(' '):
                 cv2.waitKey(0)
 
+    except KeyboardInterrupt:
+        print_tracking_session_shutdown_report(
+            reason="Ctrl+C (KeyboardInterrupt)",
+            elapsed_s=time.monotonic() - session_start,
+            frame_idx=frame_idx,
+            mirror_mode=mirror_mode,
+            servo_bridge=servo_bridge,
+            l_dir_none=gaze_stats["l_none"],
+            r_dir_none=gaze_stats["r_none"],
+            both_dir_none=gaze_stats["both_none"],
+        )
     finally:
         if servo_bridge is not None:
             servo_bridge.close()
