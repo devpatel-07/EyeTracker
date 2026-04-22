@@ -1174,7 +1174,7 @@ def run_dual_tracking(src_left, src_right=None, mirror_mode=False):
 
     # --- Servo setup ---
     servo_bridge = None
-    _servo_port = os.environ.get("EYE_TRACKER_SERVO_PORT", "").strip()
+    _servo_port = "COM6"
     if _servo_port:
         if SERIAL_AVAILABLE:
             try:
@@ -1333,8 +1333,8 @@ def dual_selection_gui():
     ttk.Combobox(root, textvariable=sel_r, values=[str(c) for c in cameras]).pack()
 
     def start_streams():
-        src_l = "http://10.159.65.65:8080?action=stream"
-        src_r = "http://10.159.65.65:8081?action=stream"
+        src_l = "http://10.159.64.115:8080?action=stream"
+        src_r = "http://10.159.64.115:8081?action=stream"
         root.destroy()
         run_dual_tracking(src_l, src_r, mirror_mode=False)
 
